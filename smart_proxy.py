@@ -284,38 +284,54 @@ class SmartProxyAddon:
             ctx.log.warn(f"[SmartProxy] Detected status {status} on unsafe method {method} - not replaying to prevent duplicate mutations.")
             return
 
-        retries = flow.metadata.get("retry_count", 0)
-        if retries >= MAX_RETRIES:
-            return
+        retries = 0
+        last_failed = current_node
+        if last_failed:
+            pool.mark_failed(last_failed)
 
-        if current_node:
-            pool.mark_failed(current_node)
-
-        next_node = pool.select_best()
-        if not next_node or (next_node == current_node and pool.count() > 1):
-            return
-
-        flow.metadata["retry_count"] = retries + 1
-        ctx.log.info(f"[SmartProxy] Detected status {status}/challenge on {method} {flow.request.host}. Rotating {current_node.key if current_node else 'none'} -> {next_node.key} (latency={next_node.ema_latency_ms:.1f}ms, attempt {retries+1})")
-
-        new_flow = flow.copy()
-        new_flow.metadata["force_proxy"] = next_node
-        new_flow.metadata["retry_count"] = retries + 1
-
-        cast(Any, ctx.master).commands.call("replay.client", [new_flow])
-
-        for _ in range(600):
-            if new_flow.response is not None or new_flow.error is not None:
+        new_flow = None
+        while retries < MAX_RETRIES:
+            next_node = pool.select_best()
+            if not next_node or (next_node == last_failed and pool.count() > 1):
                 break
-            time.sleep(0.05)
 
-        if new_flow.response is not None:
-            ctx.log.info(f"[SmartProxy] Replay success: received status {new_flow.response.status_code} from {next_node.key}")
+            retries += 1
+            ctx.log.info(f"[SmartProxy] Detected status {status}/challenge on {method} {flow.request.host}. Rotating {last_failed.key if last_failed else 'none'} -> {next_node.key} (attempt {retries}/{MAX_RETRIES})")
+
+            new_flow = flow.copy()
+            new_flow.metadata["force_proxy"] = next_node
+            new_flow.metadata["retry_count"] = retries
+
+            cast(Any, ctx.master).commands.call("replay.client", [new_flow])
+
+            for _ in range(600):
+                if new_flow.response is not None or new_flow.error is not None:
+                    break
+                time.sleep(0.05)
+
+            if new_flow.response is not None:
+                resp_status = new_flow.response.status_code
+                resp_body = new_flow.response.content or b""
+                resp_blocked = (resp_status in RETRY_STATUSES) or bool(CHALLENGE_RE.search(resp_body[:16384]))
+                if not resp_blocked:
+                    ctx.log.info(f"[SmartProxy] Replay success: received status {resp_status} from {next_node.key}")
+                    flow.response = new_flow.response
+                    flow.error = None
+                    flow.metadata["upstream_proxy"] = next_node
+                    pool.record_latency(next_node, (time.time() - start_time) * 1000.0)
+                    return
+                else:
+                    ctx.log.warn(f"[SmartProxy] Replay attempt {retries} from {next_node.key} also blocked (status {resp_status}). Quarantining and trying next exit...")
+                    pool.mark_failed(next_node)
+                    last_failed = next_node
+            else:
+                ctx.log.warn(f"[SmartProxy] Replay attempt {retries} on {next_node.key} failed ({new_flow.error}). Quarantining...")
+                pool.mark_failed(next_node)
+                last_failed = next_node
+
+        if new_flow and new_flow.response is not None:
             flow.response = new_flow.response
-            flow.metadata["upstream_proxy"] = next_node
-            pool.record_latency(next_node, (time.time() - start_time) * 1000.0)
-        else:
-            ctx.log.error(f"[SmartProxy] Replay failed or timed out on {next_node.key}: error={new_flow.error}")
+            flow.error = None
 
     @concurrent
     def error(self, flow: http.HTTPFlow) -> None:
@@ -323,40 +339,60 @@ class SmartProxyAddon:
             return
 
         current_node: Optional[ProxyNode] = flow.metadata.get("upstream_proxy")
-        if current_node:
-            pool.mark_failed(current_node)
+        start_time: float = flow.metadata.get("start_time", time.time())
 
         method = flow.request.method.upper()
         allow_replay = (method in SAFE_METHODS) or (flow.request.headers.get("X-Allow-Mutation-Replay") == "1")
         if not allow_replay:
             return
 
-        retries = flow.metadata.get("retry_count", 0)
-        if retries >= MAX_RETRIES:
-            return
+        retries = 0
+        last_failed = current_node
+        if last_failed:
+            pool.mark_failed(last_failed)
 
-        next_node = pool.select_best()
-        if not next_node or (next_node == current_node and pool.count() > 1):
-            return
-
-        flow.metadata["retry_count"] = retries + 1
-        ctx.log.info(f"[SmartProxy] Detected connection error ({flow.error}) on {method} {flow.request.host}. Rotating {current_node.key if current_node else 'none'} -> {next_node.key} (attempt {retries+1})")
-
-        new_flow = flow.copy()
-        new_flow.metadata["force_proxy"] = next_node
-        new_flow.metadata["retry_count"] = retries + 1
-
-        cast(Any, ctx.master).commands.call("replay.client", [new_flow])
-
-        for _ in range(600):
-            if new_flow.response is not None or new_flow.error is not None:
+        new_flow = None
+        while retries < MAX_RETRIES:
+            next_node = pool.select_best()
+            if not next_node or (next_node == last_failed and pool.count() > 1):
                 break
-            time.sleep(0.05)
 
-        if new_flow.response is not None:
-            ctx.log.info(f"[SmartProxy] Error-recovery replay success: status {new_flow.response.status_code} from {next_node.key}")
+            retries += 1
+            ctx.log.info(f"[SmartProxy] Detected connection error ({flow.error}) on {method} {flow.request.host}. Rotating {last_failed.key if last_failed else 'none'} -> {next_node.key} (attempt {retries}/{MAX_RETRIES})")
+
+            new_flow = flow.copy()
+            new_flow.metadata["force_proxy"] = next_node
+            new_flow.metadata["retry_count"] = retries
+
+            cast(Any, ctx.master).commands.call("replay.client", [new_flow])
+
+            for _ in range(600):
+                if new_flow.response is not None or new_flow.error is not None:
+                    break
+                time.sleep(0.05)
+
+            if new_flow.response is not None:
+                resp_status = new_flow.response.status_code
+                resp_body = new_flow.response.content or b""
+                resp_blocked = (resp_status in RETRY_STATUSES) or bool(CHALLENGE_RE.search(resp_body[:16384]))
+                if not resp_blocked:
+                    ctx.log.info(f"[SmartProxy] Error-recovery replay success: status {resp_status} from {next_node.key}")
+                    flow.response = new_flow.response
+                    flow.error = None
+                    flow.metadata["upstream_proxy"] = next_node
+                    pool.record_latency(next_node, (time.time() - start_time) * 1000.0)
+                    return
+                else:
+                    ctx.log.warn(f"[SmartProxy] Error-recovery attempt {retries} from {next_node.key} returned block status {resp_status}. Quarantining...")
+                    pool.mark_failed(next_node)
+                    last_failed = next_node
+            else:
+                ctx.log.warn(f"[SmartProxy] Error-recovery attempt {retries} on {next_node.key} failed ({new_flow.error}). Quarantining...")
+                pool.mark_failed(next_node)
+                last_failed = next_node
+
+        if new_flow and new_flow.response is not None:
             flow.response = new_flow.response
             flow.error = None
-            flow.metadata["upstream_proxy"] = next_node
 
 addons = [SmartProxyAddon()]
