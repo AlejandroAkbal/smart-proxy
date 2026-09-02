@@ -198,6 +198,9 @@ class SmartProxyAddon:
         else:
             self.authenticated_conns.add(flow.client_conn.id)
 
+    def client_disconnected(self, client: Any) -> None:
+        self.authenticated_conns.discard(getattr(client, "id", None))
+
     def request(self, flow: http.HTTPFlow) -> None:
         is_authenticated = (flow.client_conn.id in self.authenticated_conns) or _check_auth(flow)
         if not is_authenticated:
