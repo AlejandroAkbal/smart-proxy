@@ -6,7 +6,7 @@ import logging
 import threading
 import urllib.request
 import urllib.parse
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Optional, Tuple, Any, cast
 
 from mitmproxy import http, ctx
@@ -24,24 +24,38 @@ COOLDOWN_SECONDS = int(os.environ.get("COOLDOWN_SECONDS", "600"))
 MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "2"))
 ADAPTER_URL = os.environ.get("ADAPTER_URL", "").rstrip("/")
 ADAPTER_REFRESH_INTERVAL = int(os.environ.get("ADAPTER_REFRESH_INTERVAL", "300"))
+PROXY_AUTH = os.environ.get("PROXY_AUTH", "")
 
 @dataclass
 class ProxyNode:
-    scheme: str # "http" or "socks5"
+    scheme: str # "http"
     host: str
     port: int
     auth: Optional[str] = None
     cooldown_until: float = 0.0
+    ema_latency_ms: float = 500.0 # Initial default latency
+    success_count: int = 0
+    failure_count: int = 0
 
     @property
     def key(self) -> str:
         return f"{self.scheme}://{self.host}:{self.port}"
 
-class StickyPool:
+    def record_success(self, duration_ms: float):
+        self.success_count += 1
+        # Exponential moving average with alpha=0.25
+        self.ema_latency_ms = (0.25 * duration_ms) + (0.75 * self.ema_latency_ms)
+
+    def record_failure(self):
+        self.failure_count += 1
+        self.cooldown_until = time.time() + COOLDOWN_SECONDS
+        self.ema_latency_ms += 1500.0 # Latency penalty for flaky nodes
+
+class StickyLatencyPool:
     def __init__(self):
         self.lock = threading.Lock()
         self.nodes: List[ProxyNode] = []
-        self.current_idx: int = 0
+        self.current_node: Optional[ProxyNode] = None
 
     def update_nodes(self, new_nodes: List[ProxyNode]):
         if not new_nodes:
@@ -51,38 +65,57 @@ class StickyPool:
             merged = []
             for n in new_nodes:
                 if n.key in existing:
-                    n.cooldown_until = existing[n.key].cooldown_until
+                    old = existing[n.key]
+                    n.cooldown_until = old.cooldown_until
+                    n.ema_latency_ms = old.ema_latency_ms
+                    n.success_count = old.success_count
+                    n.failure_count = old.failure_count
                 merged.append(n)
             self.nodes = merged
-            if self.nodes:
-                self.current_idx = self.current_idx % len(self.nodes)
+            if self.current_node and self.current_node.key in existing:
+                self.current_node = existing[self.current_node.key]
 
-    def current(self) -> Optional[ProxyNode]:
+    def select_best(self) -> Optional[ProxyNode]:
+        """Picks the lowest latency healthy node."""
         with self.lock:
             if not self.nodes:
                 return None
             now = time.time()
-            for i in range(len(self.nodes)):
-                idx = (self.current_idx + i) % len(self.nodes)
-                if self.nodes[idx].cooldown_until <= now:
-                    self.current_idx = idx
-                    return self.nodes[idx]
+            healthy = [n for n in self.nodes if n.cooldown_until <= now]
+            if healthy:
+                # Sort by lowest latency, then fewest failures
+                healthy.sort(key=lambda n: (n.ema_latency_ms, n.failure_count))
+                self.current_node = healthy[0]
+                return self.current_node
             # If all in cooldown, pick the one expiring earliest
             earliest = min(self.nodes, key=lambda n: n.cooldown_until)
-            self.current_idx = self.nodes.index(earliest)
+            self.current_node = earliest
             return earliest
+
+    def get_current_or_best(self) -> Optional[ProxyNode]:
+        """Keeps active sticky node if healthy; otherwise picks best."""
+        with self.lock:
+            now = time.time()
+            if self.current_node and self.current_node.cooldown_until <= now:
+                return self.current_node
+        return self.select_best()
 
     def mark_failed(self, node: ProxyNode):
         with self.lock:
-            node.cooldown_until = time.time() + COOLDOWN_SECONDS
-            if self.nodes:
-                self.current_idx = (self.current_idx + 1) % len(self.nodes)
+            node.record_failure()
+            # Invalidate current sticky node so next request re-evaluates
+            if self.current_node and self.current_node.key == node.key:
+                self.current_node = None
+
+    def record_latency(self, node: ProxyNode, duration_ms: float):
+        with self.lock:
+            node.record_success(duration_ms)
 
     def count(self) -> int:
         with self.lock:
             return len(self.nodes)
 
-pool = StickyPool()
+pool = StickyLatencyPool()
 
 def _parse_yaml_proxies(raw_text: str) -> List[ProxyNode]:
     nodes = []
@@ -149,8 +182,6 @@ def _background_updater():
             ctx.log.warn(f"[SmartProxy] Pool refresh error: {e}")
         time.sleep(ADAPTER_REFRESH_INTERVAL)
 
-PROXY_AUTH = os.environ.get("PROXY_AUTH", "")
-
 def _check_auth(flow: http.HTTPFlow) -> bool:
     if not PROXY_AUTH:
         return True
@@ -184,7 +215,6 @@ class SmartProxyAddon:
                 pool.update_nodes(nodes)
 
         if ADAPTER_URL:
-            # Immediate initial fetch
             threading.Thread(target=_refresh_from_adapter, daemon=True).start()
             threading.Thread(target=_background_updater, daemon=True).start()
 
@@ -211,14 +241,13 @@ class SmartProxyAddon:
             )
             return
 
-        # Strip Proxy-Authorization header before forwarding upstream
         flow.request.headers.pop("Proxy-Authorization", None)
-
-        node = flow.metadata.pop("force_proxy", None) or pool.current()
+        node = flow.metadata.pop("force_proxy", None) or pool.get_current_or_best()
         if not node:
             return
 
         flow.metadata["upstream_proxy"] = node
+        flow.metadata["start_time"] = time.time()
         spec = ServerSpec((node.scheme, (node.host, node.port)))
 
         is_proxy_change = (flow.server_conn.via != spec)
@@ -232,11 +261,18 @@ class SmartProxyAddon:
         if flow.response is None or flow.is_replay:
             return
 
+        current_node: Optional[ProxyNode] = flow.metadata.get("upstream_proxy")
+        start_time: float = flow.metadata.get("start_time", time.time())
+        duration_ms = (time.time() - start_time) * 1000.0
+
         status = flow.response.status_code
         body = flow.response.content or b""
         is_blocked = (status in RETRY_STATUSES) or bool(CHALLENGE_RE.search(body[:16384]))
 
         if not is_blocked:
+            # Record successful response latency
+            if current_node:
+                pool.record_latency(current_node, duration_ms)
             return
 
         method = flow.request.method.upper()
@@ -249,16 +285,15 @@ class SmartProxyAddon:
         if retries >= MAX_RETRIES:
             return
 
-        current_node = flow.metadata.get("upstream_proxy")
         if current_node:
             pool.mark_failed(current_node)
 
-        next_node = pool.current()
+        next_node = pool.select_best()
         if not next_node or (next_node == current_node and pool.count() > 1):
             return
 
         flow.metadata["retry_count"] = retries + 1
-        ctx.log.info(f"[SmartProxy] Detected status {status}/challenge on {method} {flow.request.host}. Rotating {current_node.key} -> {next_node.key} (attempt {retries+1})")
+        ctx.log.info(f"[SmartProxy] Detected status {status}/challenge on {method} {flow.request.host}. Rotating {current_node.key if current_node else 'none'} -> {next_node.key} (latency={next_node.ema_latency_ms:.1f}ms, attempt {retries+1})")
 
         new_flow = flow.copy()
         new_flow.metadata["force_proxy"] = next_node
@@ -275,6 +310,7 @@ class SmartProxyAddon:
             ctx.log.info(f"[SmartProxy] Replay success: received status {new_flow.response.status_code} from {next_node.key}")
             flow.response = new_flow.response
             flow.metadata["upstream_proxy"] = next_node
+            pool.record_latency(next_node, (time.time() - start_time) * 1000.0)
         else:
             ctx.log.error(f"[SmartProxy] Replay failed or timed out on {next_node.key}: error={new_flow.error}")
 
