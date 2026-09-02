@@ -5,4 +5,4 @@ COPY smart_proxy.py /app/smart_proxy.py
 
 EXPOSE 8080
 
-ENTRYPOINT ["mitmdump", "-p", "8080", "-s", "/app/smart_proxy.py", "--set", "confdir=/ca", "--set", "connection_strategy=lazy", "--set", "upstream_cert=false"]
+ENTRYPOINT ["mitmdump", "-p", "8080", "-s", "/app/smart_proxy.py", "--set", "confdir=/ca", "--set", "connection_strategy=lazy", "--set", "upstream_cert=false", "--set", "block_global=false"]
