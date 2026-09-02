@@ -9,8 +9,8 @@ import urllib.parse
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple, Any, cast
 
-# Strict timeout on upstream socket connections to prevent hanging on dead proxies
-socket.setdefaulttimeout(6.0)
+# Reasonable timeout on upstream socket connections to prune completely dead proxies without cutting off slow boorus
+socket.setdefaulttimeout(10.0)
 
 from mitmproxy import http, ctx
 from mitmproxy.connection import Server
@@ -23,8 +23,8 @@ CHALLENGE_RE = re.compile(
 )
 RETRY_STATUSES = {403, 429, 503}
 SAFE_METHODS = {"GET", "HEAD", "OPTIONS", "PUT", "DELETE"}
-COOLDOWN_SECONDS = int(os.environ.get("COOLDOWN_SECONDS", "1800"))
-MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "1"))
+COOLDOWN_SECONDS = int(os.environ.get("COOLDOWN_SECONDS", "900"))
+MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "3"))
 ADAPTER_URL = os.environ.get("ADAPTER_URL", "").rstrip("/")
 ADAPTER_REFRESH_INTERVAL = int(os.environ.get("ADAPTER_REFRESH_INTERVAL", "300"))
 PROXY_AUTH = os.environ.get("PROXY_AUTH", "")
@@ -304,7 +304,7 @@ class SmartProxyAddon:
 
         cast(Any, ctx.master).commands.call("replay.client", [new_flow])
 
-        for _ in range(80):
+        for _ in range(600):
             if new_flow.response is not None or new_flow.error is not None:
                 break
             time.sleep(0.05)
@@ -348,7 +348,7 @@ class SmartProxyAddon:
 
         cast(Any, ctx.master).commands.call("replay.client", [new_flow])
 
-        for _ in range(80):
+        for _ in range(600):
             if new_flow.response is not None or new_flow.error is not None:
                 break
             time.sleep(0.05)
