@@ -150,6 +150,12 @@ def _background_updater():
         time.sleep(ADAPTER_REFRESH_INTERVAL)
 
 class SmartProxyAddon:
+    def load(self, loader):
+        auth = os.environ.get("PROXY_AUTH", "")
+        if auth:
+            ctx.options.proxyauth = auth
+            ctx.log.info("[SmartProxy] Proxy authentication enabled.")
+
     def __init__(self):
         raw_env = os.environ.get("UPSTREAM_PROXIES", "")
         if raw_env:
