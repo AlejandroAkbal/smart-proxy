@@ -3,11 +3,19 @@ import os
 import time
 import socket
 import logging
+import resource
 import threading
 import urllib.request
 import urllib.parse
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple, Any, cast
+
+# Raise open file descriptor soft limit from Docker's default 1024 to hard limit (524288)
+try:
+    _soft, _hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    resource.setrlimit(resource.RLIMIT_NOFILE, (_hard, _hard))
+except Exception:
+    pass
 
 from mitmproxy import http, ctx
 from mitmproxy.connection import Server
