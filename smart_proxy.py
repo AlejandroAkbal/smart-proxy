@@ -136,10 +136,10 @@ def _refresh_from_adapter():
             pass
 
     if all_nodes:
-        valid = [n for n in all_nodes if n.scheme in ("http", "socks5")]
+        valid = [n for n in all_nodes if n.scheme == "http"]
         if valid:
             pool.update_nodes(valid)
-            ctx.log.info(f"[SmartProxy] Refreshed pool from adapter: {len(valid)} healthy nodes.")
+            ctx.log.info(f"[SmartProxy] Refreshed pool from adapter: {len(valid)} healthy HTTP nodes.")
 
 def _background_updater():
     while True:
