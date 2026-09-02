@@ -149,14 +149,25 @@ def _background_updater():
             ctx.log.warn(f"[SmartProxy] Pool refresh error: {e}")
         time.sleep(ADAPTER_REFRESH_INTERVAL)
 
-class SmartProxyAddon:
-    def load(self, loader):
-        auth = os.environ.get("PROXY_AUTH", "")
-        if auth:
-            ctx.options.proxyauth = auth
-            ctx.log.info("[SmartProxy] Proxy authentication enabled.")
+PROXY_AUTH = os.environ.get("PROXY_AUTH", "")
 
+def _check_auth(flow: http.HTTPFlow) -> bool:
+    if not PROXY_AUTH:
+        return True
+    auth_header = flow.request.headers.get("Proxy-Authorization", "")
+    if not auth_header.startswith("Basic "):
+        return False
+    try:
+        import base64
+        decoded = base64.b64decode(auth_header[6:].strip()).decode("utf-8")
+        return decoded == PROXY_AUTH
+    except Exception:
+        return False
+
+class SmartProxyAddon:
     def __init__(self):
+        if PROXY_AUTH:
+            ctx.log.info(f"[SmartProxy] Authentication enabled for user: {PROXY_AUTH.split(':', 1)[0]}")
         raw_env = os.environ.get("UPSTREAM_PROXIES", "")
         if raw_env:
             nodes = []
@@ -176,7 +187,26 @@ class SmartProxyAddon:
             threading.Thread(target=_refresh_from_adapter, daemon=True).start()
             threading.Thread(target=_background_updater, daemon=True).start()
 
+    def http_connect(self, flow: http.HTTPFlow) -> None:
+        if not _check_auth(flow):
+            flow.response = http.Response.make(
+                407,
+                b"Proxy Authentication Required\n",
+                {"Proxy-Authenticate": 'Basic realm="Smart Proxy"'}
+            )
+
     def request(self, flow: http.HTTPFlow) -> None:
+        if not _check_auth(flow):
+            flow.response = http.Response.make(
+                407,
+                b"Proxy Authentication Required\n",
+                {"Proxy-Authenticate": 'Basic realm="Smart Proxy"'}
+            )
+            return
+
+        # Strip Proxy-Authorization header before forwarding upstream
+        flow.request.headers.pop("Proxy-Authorization", None)
+
         node = flow.metadata.pop("force_proxy", None) or pool.current()
         if not node:
             return
