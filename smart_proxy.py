@@ -166,6 +166,7 @@ def _check_auth(flow: http.HTTPFlow) -> bool:
 
 class SmartProxyAddon:
     def __init__(self):
+        self.authenticated_conns = set()
         if PROXY_AUTH:
             ctx.log.info(f"[SmartProxy] Authentication enabled for user: {PROXY_AUTH.split(':', 1)[0]}")
         raw_env = os.environ.get("UPSTREAM_PROXIES", "")
@@ -194,9 +195,12 @@ class SmartProxyAddon:
                 b"Proxy Authentication Required\n",
                 {"Proxy-Authenticate": 'Basic realm="Smart Proxy"'}
             )
+        else:
+            self.authenticated_conns.add(flow.client_conn.id)
 
     def request(self, flow: http.HTTPFlow) -> None:
-        if not _check_auth(flow):
+        is_authenticated = (flow.client_conn.id in self.authenticated_conns) or _check_auth(flow)
+        if not is_authenticated:
             flow.response = http.Response.make(
                 407,
                 b"Proxy Authentication Required\n",
