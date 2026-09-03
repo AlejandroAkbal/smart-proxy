@@ -25,7 +25,7 @@ CHALLENGE_RE = re.compile(
 RETRY_STATUSES = {403, 429, 503}
 SAFE_METHODS = {"GET", "HEAD", "OPTIONS", "PUT", "DELETE"}
 COOLDOWN_SECONDS = int(os.environ.get("COOLDOWN_SECONDS", "900"))
-MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "3"))
+MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "5"))
 ADAPTER_URL = os.environ.get("ADAPTER_URL", "").rstrip("/")
 ADAPTER_REFRESH_INTERVAL = int(os.environ.get("ADAPTER_REFRESH_INTERVAL", "300"))
 PROXY_AUTH = os.environ.get("PROXY_AUTH", "")
@@ -257,9 +257,8 @@ def _fetch_upstream(flow: http.HTTPFlow, node: ProxyNode, timeout: float = 6.0) 
     opener = urllib.request.build_opener(handler)
 
     headers = dict(flow.request.headers)
-    for h in ["proxy-authorization", "proxy-connection", "connection", "keep-alive"]:
+    for h in ["proxy-authorization", "proxy-connection", "connection", "keep-alive", "host", "Host"]:
         headers.pop(h, None)
-        headers.pop(h.title(), None)
 
     body = flow.request.content if flow.request.content else None
     req = urllib.request.Request(
@@ -307,6 +306,17 @@ class SmartProxyAddon:
                 b"Proxy Authentication Required\n",
                 {"Proxy-Authenticate": 'Basic realm="Smart Proxy"'}
             )
+
+    def server_connect(self, data) -> None:
+        if not data.server.address:
+            return
+        host = data.server.address[0]
+        domain = _extract_root_domain(host)
+        node = pool.get_current_or_best(domain)
+        if node:
+            spec = ServerSpec((node.scheme, (node.host, node.port)))
+            data.server.via = spec
+            ctx.log.info(f"[SmartProxy] Routing server connection for {host} ({domain}) via {node.key}")
 
     def request(self, flow: http.HTTPFlow) -> None:
         is_authenticated = (flow.client_conn.id in self.authenticated_conns) or _check_auth(flow)
