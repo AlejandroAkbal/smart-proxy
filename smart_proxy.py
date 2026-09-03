@@ -18,6 +18,9 @@ from mitmproxy import http, ctx
 from mitmproxy.connection import Server
 from mitmproxy.net.server_spec import ServerSpec
 
+logger = logging.getLogger("smart_proxy")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
 CHALLENGE_RE = re.compile(
     rb"captcha|cf-chl|challenge-platform|unusual traffic|temporarily blocked|just a moment|security check|cloudflare-static",
     re.I
@@ -212,15 +215,21 @@ def _refresh_from_adapter():
         valid = [n for n in all_nodes if n.scheme == "http"]
         if valid:
             pool.update_nodes(valid)
-            ctx.log.info(f"[SmartProxy] Refreshed pool from adapter: {len(valid)} healthy HTTP nodes.")
+            logger.info(f"[SmartProxy] Refreshed pool from adapter: {len(valid)} healthy HTTP nodes.")
 
 def _background_updater():
     while True:
         try:
             _refresh_from_adapter()
         except Exception as e:
-            ctx.log.warn(f"[SmartProxy] Pool refresh error: {e}")
+            logger.warn(f"[SmartProxy] Pool refresh error: {e}")
         time.sleep(ADAPTER_REFRESH_INTERVAL)
+
+# Initial load on import
+try:
+    _refresh_from_adapter()
+except Exception:
+    pass
 
 def _check_auth(flow: http.HTTPFlow) -> bool:
     if not PROXY_AUTH:
@@ -289,6 +298,12 @@ def _fetch_upstream(flow: http.HTTPFlow, node: ProxyNode, timeout: float = 6.0) 
 class SmartProxyAddon:
     def __init__(self):
         self.authenticated_conns = set()
+
+    def running(self) -> None:
+        _refresh_from_adapter()
+        t = threading.Thread(target=_background_updater, daemon=True)
+        t.start()
+        logger.info("[SmartProxy] Background proxy pool updater started.")
 
     def client_disconnected(self, client: http.Client) -> None:
         self.authenticated_conns.discard(client.id)
