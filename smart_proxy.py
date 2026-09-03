@@ -318,7 +318,7 @@ class SmartProxyAddon:
             data.server.via = spec
             ctx.log.info(f"[SmartProxy] Routing server connection for {host} ({domain}) via {node.key}")
 
-    def request(self, flow: http.HTTPFlow) -> None:
+    def requestheaders(self, flow: http.HTTPFlow) -> None:
         is_authenticated = (flow.client_conn.id in self.authenticated_conns) or _check_auth(flow)
         if not is_authenticated:
             flow.response = http.Response.make(
@@ -338,10 +338,16 @@ class SmartProxyAddon:
         flow.metadata["upstream_proxy"] = node
         flow.metadata["start_time"] = time.time()
         spec = ServerSpec((node.scheme, (node.host, node.port)))
-
-        if flow.server_conn.via != spec or flow.server_conn.timestamp_start is not None:
-            flow.server_conn = Server(address=flow.server_conn.address)
         flow.server_conn.via = spec
+
+    def request(self, flow: http.HTTPFlow) -> None:
+        if flow.response is not None:
+            return
+        domain = flow.metadata.get("target_domain") or _extract_root_domain(flow.request.pretty_host)
+        node = flow.metadata.get("upstream_proxy") or pool.get_current_or_best(domain)
+        if node:
+            spec = ServerSpec((node.scheme, (node.host, node.port)))
+            flow.server_conn.via = spec
 
     def response(self, flow: http.HTTPFlow) -> None:
         if flow.response is None or flow.is_replay:
