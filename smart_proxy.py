@@ -91,6 +91,7 @@ class StickyLatencyPool:
         self.lock = threading.Lock()
         self.nodes: List[ProxyNode] = []
         self.current_nodes: dict[str, ProxyNode] = {} # domain -> sticky ProxyNode
+        self.cursor: int = 0
 
     def update_nodes(self, new_nodes: List[ProxyNode]):
         if not new_nodes:
@@ -119,7 +120,7 @@ class StickyLatencyPool:
                     self.current_nodes[domain] = existing[node.key]
 
     def select_best_for(self, domain: str) -> Optional[ProxyNode]:
-        """Picks the lowest latency node available for domain."""
+        """Picks a healthy node from top candidates to distribute load across IPs."""
         with self.lock:
             if not self.nodes:
                 return None
@@ -127,20 +128,14 @@ class StickyLatencyPool:
             healthy = [n for n in self.nodes if n.is_available_for(domain, now)]
             if healthy:
                 healthy.sort(key=lambda n: (n.ema_latency_ms, n.failure_count))
-                self.current_nodes[domain] = healthy[0]
-                return healthy[0]
+                top_pool = healthy[:min(8, len(healthy))]
+                self.cursor = (self.cursor + 1) % len(top_pool)
+                return top_pool[self.cursor]
             # Fallback: if all on cooldown for this domain, pick earliest expiring
-            earliest = min(self.nodes, key=lambda n: n.get_effective_cooldown(domain))
-            self.current_nodes[domain] = earliest
-            return earliest
+            return min(self.nodes, key=lambda n: n.get_effective_cooldown(domain))
 
     def get_current_or_best(self, domain: str) -> Optional[ProxyNode]:
-        """Keeps active sticky node for domain if healthy; otherwise picks best."""
-        with self.lock:
-            now = time.time()
-            current = self.current_nodes.get(domain)
-            if current and current.is_available_for(domain, now):
-                return current
+        """Rotates among top healthy nodes to prevent IP rate-limiting on target booru."""
         return self.select_best_for(domain)
 
     def set_current_node(self, domain: str, node: ProxyNode):
