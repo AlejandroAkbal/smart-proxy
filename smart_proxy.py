@@ -271,11 +271,17 @@ def _fetch_upstream(flow: http.HTTPFlow, node: ProxyNode, timeout: float = 6.0) 
     try:
         with opener.open(req, timeout=timeout) as resp:
             content = resp.read()
-            resp_headers = [(k, v) for k, v in resp.headers.items()]
+            resp_headers = [
+                (k.encode("utf-8"), v.encode("utf-8"))
+                for k, v in resp.headers.items()
+            ]
             return http.Response.make(resp.status, content, resp_headers)
     except urllib.error.HTTPError as e:
         content = e.read()
-        resp_headers = [(k, v) for k, v in e.headers.items()]
+        resp_headers = [
+            (k.encode("utf-8"), v.encode("utf-8"))
+            for k, v in e.headers.items()
+        ]
         return http.Response.make(e.code, content, resp_headers)
     except Exception:
         return None
