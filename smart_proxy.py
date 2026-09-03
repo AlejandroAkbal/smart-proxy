@@ -6,6 +6,8 @@ import logging
 import threading
 import urllib.request
 import urllib.parse
+import gzip
+import zlib
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple, Any, cast
 
@@ -198,42 +200,75 @@ def _check_auth(flow: http.HTTPFlow) -> bool:
     except Exception:
         return False
 
+def _extract_sample_body(content: bytes, encoding: Optional[str]) -> bytes:
+    if not content:
+        return b""
+    if encoding == "gzip":
+        try:
+            return gzip.decompress(content)[:16384]
+        except Exception:
+            pass
+    elif encoding == "deflate":
+        try:
+            return zlib.decompress(content)[:16384]
+        except Exception:
+            pass
+    return content[:16384]
+
+
+def _fetch_upstream(flow: http.HTTPFlow, node: ProxyNode, timeout: float = 6.0) -> Optional[http.Response]:
+    proxy_url = f"{node.scheme}://{node.host}:{node.port}"
+    handler = urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})
+    opener = urllib.request.build_opener(handler)
+
+    headers = dict(flow.request.headers)
+    for h in ["proxy-authorization", "proxy-connection", "connection", "keep-alive"]:
+        headers.pop(h, None)
+        headers.pop(h.title(), None)
+
+    body = flow.request.content if flow.request.content else None
+    req = urllib.request.Request(
+        flow.request.url,
+        data=body,
+        headers=headers,
+        method=flow.request.method
+    )
+    try:
+        with opener.open(req, timeout=timeout) as resp:
+            content = resp.read()
+            resp_headers = [(k, v) for k, v in resp.headers.items()]
+            return http.Response.make(resp.status, content, resp_headers)
+    except urllib.error.HTTPError as e:
+        content = e.read()
+        resp_headers = [(k, v) for k, v in e.headers.items()]
+        return http.Response.make(e.code, content, resp_headers)
+    except Exception:
+        return None
+
+
 class SmartProxyAddon:
     def __init__(self):
         self.authenticated_conns = set()
-        if PROXY_AUTH:
-            ctx.log.info(f"[SmartProxy] Authentication enabled for user: {PROXY_AUTH.split(':', 1)[0]}")
-        raw_env = os.environ.get("UPSTREAM_PROXIES", "")
-        if raw_env:
-            nodes = []
-            for raw in raw_env.split(","):
-                raw = raw.strip()
-                if not raw: continue
-                if not raw.startswith("http://") and not raw.startswith("socks5://"):
-                    raw = "http://" + raw
-                p = urllib.parse.urlsplit(raw)
-                auth = f"{p.username}:{p.password}" if p.username else None
-                nodes.append(ProxyNode(scheme=p.scheme, host=p.hostname, port=p.port or 80, auth=auth))
-            if nodes:
-                pool.update_nodes(nodes)
 
-        if ADAPTER_URL:
-            threading.Thread(target=_refresh_from_adapter, daemon=True).start()
-            threading.Thread(target=_background_updater, daemon=True).start()
+    def client_disconnected(self, client: http.Client) -> None:
+        self.authenticated_conns.discard(client.id)
 
+    @concurrent
     def http_connect(self, flow: http.HTTPFlow) -> None:
-        if not _check_auth(flow):
+        if not PROXY_AUTH:
+            return
+
+        if _check_auth(flow):
+            self.authenticated_conns.add(flow.client_conn.id)
+            flow.response = http.Response.make(200, b"")
+        else:
             flow.response = http.Response.make(
                 407,
                 b"Proxy Authentication Required\n",
                 {"Proxy-Authenticate": 'Basic realm="Smart Proxy"'}
             )
-        else:
-            self.authenticated_conns.add(flow.client_conn.id)
 
-    def client_disconnected(self, client: Any) -> None:
-        self.authenticated_conns.discard(getattr(client, "id", None))
-
+    @concurrent
     def request(self, flow: http.HTTPFlow) -> None:
         is_authenticated = (flow.client_conn.id in self.authenticated_conns) or _check_auth(flow)
         if not is_authenticated:
@@ -268,7 +303,8 @@ class SmartProxyAddon:
 
         status = flow.response.status_code
         body = flow.response.content or b""
-        is_blocked = (status in RETRY_STATUSES) or bool(CHALLENGE_RE.search(body[:16384]))
+        sample = _extract_sample_body(body, flow.response.headers.get("content-encoding"))
+        is_blocked = (status in RETRY_STATUSES) or bool(CHALLENGE_RE.search(sample))
 
         if not is_blocked:
             # Record successful response latency
@@ -282,57 +318,36 @@ class SmartProxyAddon:
             ctx.log.warn(f"[SmartProxy] Detected status {status} on unsafe method {method} - not replaying to prevent duplicate mutations.")
             return
 
-        retries = 0
         last_failed = current_node
         if last_failed:
             pool.mark_failed(last_failed)
 
-        new_flow = None
-        while retries < MAX_RETRIES:
+        for retry_num in range(1, MAX_RETRIES + 1):
             next_node = pool.select_best()
             if not next_node or (next_node == last_failed and pool.count() > 1):
                 break
 
-            retries += 1
-            ctx.log.info(f"[SmartProxy] Detected status {status}/challenge on {method} {flow.request.host}. Rotating {last_failed.key if last_failed else 'none'} -> {next_node.key} (attempt {retries}/{MAX_RETRIES})")
-
-            new_flow = flow.copy()
-            new_flow.server_conn = Server(address=flow.server_conn.address)
-            new_flow.response = None
-            new_flow.error = None
-            new_flow.metadata["force_proxy"] = next_node
-            new_flow.metadata["retry_count"] = retries
-
-            cast(Any, ctx.master).commands.call("replay.client", [new_flow])
-
-            for _ in range(600):
-                if new_flow.response is not None or new_flow.error is not None:
-                    break
-                time.sleep(0.05)
-
-            if new_flow.response is not None:
-                resp_status = new_flow.response.status_code
-                resp_body = new_flow.response.content or b""
-                resp_blocked = (resp_status in RETRY_STATUSES) or bool(CHALLENGE_RE.search(resp_body[:16384]))
+            ctx.log.info(f"[SmartProxy] Detected status {status}/challenge on {method} {flow.request.host}. Rotating {last_failed.key if last_failed else 'none'} -> {next_node.key} (attempt {retry_num}/{MAX_RETRIES})")
+            resp = _fetch_upstream(flow, next_node, timeout=6.0)
+            if resp is not None:
+                resp_status = resp.status_code
+                resp_body = resp.content or b""
+                resp_sample = _extract_sample_body(resp_body, resp.headers.get("content-encoding"))
+                resp_blocked = (resp_status in RETRY_STATUSES) or bool(CHALLENGE_RE.search(resp_sample))
                 if not resp_blocked:
                     ctx.log.info(f"[SmartProxy] Replay success: received status {resp_status} from {next_node.key}")
-                    flow.response = new_flow.response
+                    flow.response = resp
                     flow.error = None
                     flow.metadata["upstream_proxy"] = next_node
                     pool.record_latency(next_node, (time.time() - start_time) * 1000.0)
                     return
                 else:
-                    ctx.log.warn(f"[SmartProxy] Replay attempt {retries} from {next_node.key} also blocked (status {resp_status}). Quarantining and trying next exit...")
-                    pool.mark_failed(next_node)
-                    last_failed = next_node
+                    ctx.log.warn(f"[SmartProxy] Replay attempt {retry_num} on {next_node.key} returned status {resp_status}/challenge. Quarantining...")
             else:
-                ctx.log.warn(f"[SmartProxy] Replay attempt {retries} on {next_node.key} failed ({new_flow.error}). Quarantining...")
-                pool.mark_failed(next_node)
-                last_failed = next_node
+                ctx.log.warn(f"[SmartProxy] Replay attempt {retry_num} on {next_node.key} timed out or connection failed. Quarantining...")
 
-        if new_flow and new_flow.response is not None:
-            flow.response = new_flow.response
-            flow.error = None
+            pool.mark_failed(next_node)
+            last_failed = next_node
 
     @concurrent
     def error(self, flow: http.HTTPFlow) -> None:
@@ -347,56 +362,35 @@ class SmartProxyAddon:
         if not allow_replay:
             return
 
-        retries = 0
         last_failed = current_node
         if last_failed:
             pool.mark_failed(last_failed)
 
-        new_flow = None
-        while retries < MAX_RETRIES:
+        for retry_num in range(1, MAX_RETRIES + 1):
             next_node = pool.select_best()
             if not next_node or (next_node == last_failed and pool.count() > 1):
                 break
 
-            retries += 1
-            ctx.log.info(f"[SmartProxy] Detected connection error ({flow.error}) on {method} {flow.request.host}. Rotating {last_failed.key if last_failed else 'none'} -> {next_node.key} (attempt {retries}/{MAX_RETRIES})")
-
-            new_flow = flow.copy()
-            new_flow.server_conn = Server(address=flow.server_conn.address)
-            new_flow.response = None
-            new_flow.error = None
-            new_flow.metadata["force_proxy"] = next_node
-            new_flow.metadata["retry_count"] = retries
-
-            cast(Any, ctx.master).commands.call("replay.client", [new_flow])
-
-            for _ in range(600):
-                if new_flow.response is not None or new_flow.error is not None:
-                    break
-                time.sleep(0.05)
-
-            if new_flow.response is not None:
-                resp_status = new_flow.response.status_code
-                resp_body = new_flow.response.content or b""
-                resp_blocked = (resp_status in RETRY_STATUSES) or bool(CHALLENGE_RE.search(resp_body[:16384]))
+            ctx.log.info(f"[SmartProxy] Detected connection error ({flow.error}) on {method} {flow.request.host}. Rotating {last_failed.key if last_failed else 'none'} -> {next_node.key} (attempt {retry_num}/{MAX_RETRIES})")
+            resp = _fetch_upstream(flow, next_node, timeout=6.0)
+            if resp is not None:
+                resp_status = resp.status_code
+                resp_body = resp.content or b""
+                resp_sample = _extract_sample_body(resp_body, resp.headers.get("content-encoding"))
+                resp_blocked = (resp_status in RETRY_STATUSES) or bool(CHALLENGE_RE.search(resp_sample))
                 if not resp_blocked:
-                    ctx.log.info(f"[SmartProxy] Error-recovery replay success: status {resp_status} from {next_node.key}")
-                    flow.response = new_flow.response
+                    ctx.log.info(f"[SmartProxy] Error-recovery success: received status {resp_status} from {next_node.key}")
+                    flow.response = resp
                     flow.error = None
                     flow.metadata["upstream_proxy"] = next_node
                     pool.record_latency(next_node, (time.time() - start_time) * 1000.0)
                     return
                 else:
-                    ctx.log.warn(f"[SmartProxy] Error-recovery attempt {retries} from {next_node.key} returned block status {resp_status}. Quarantining...")
-                    pool.mark_failed(next_node)
-                    last_failed = next_node
+                    ctx.log.warn(f"[SmartProxy] Error-recovery attempt {retry_num} on {next_node.key} returned status {resp_status}/challenge. Quarantining...")
             else:
-                ctx.log.warn(f"[SmartProxy] Error-recovery attempt {retries} on {next_node.key} failed ({new_flow.error}). Quarantining...")
-                pool.mark_failed(next_node)
-                last_failed = next_node
+                ctx.log.warn(f"[SmartProxy] Error-recovery attempt {retry_num} on {next_node.key} timed out or connection failed. Quarantining...")
 
-        if new_flow and new_flow.response is not None:
-            flow.response = new_flow.response
-            flow.error = None
+            pool.mark_failed(next_node)
+            last_failed = next_node
 
 addons = [SmartProxyAddon()]
