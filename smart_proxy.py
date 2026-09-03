@@ -27,8 +27,8 @@ CHALLENGE_RE = re.compile(
 )
 RETRY_STATUSES = {403, 429, 503}
 SAFE_METHODS = {"GET", "HEAD", "OPTIONS", "PUT", "DELETE"}
-COOLDOWN_SECONDS = int(os.environ.get("COOLDOWN_SECONDS", "900"))
-MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "5"))
+COOLDOWN_SECONDS = int(os.environ.get("COOLDOWN_SECONDS", "300"))
+MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "3"))
 ADAPTER_URL = os.environ.get("ADAPTER_URL", "").rstrip("/")
 ADAPTER_REFRESH_INTERVAL = int(os.environ.get("ADAPTER_REFRESH_INTERVAL", "300"))
 PROXY_AUTH = os.environ.get("PROXY_AUTH", "")
@@ -97,16 +97,22 @@ class StickyLatencyPool:
             return
         with self.lock:
             existing = {n.key: n for n in self.nodes}
-            merged = []
+            unique_new: dict[str, ProxyNode] = {}
             for n in new_nodes:
-                if n.key in existing:
-                    old = existing[n.key]
-                    n.global_cooldown_until = old.global_cooldown_until
-                    n.host_cooldowns = old.host_cooldowns
-                    n.ema_latency_ms = old.ema_latency_ms
-                    n.success_count = old.success_count
-                    n.failure_count = old.failure_count
-                merged.append(n)
+                if n.key not in unique_new:
+                    unique_new[n.key] = n
+
+            merged = []
+            for key, n in unique_new.items():
+                if key in existing:
+                    old = existing[key]
+                    old.scheme = n.scheme
+                    old.host = n.host
+                    old.port = n.port
+                    old.auth = n.auth
+                    merged.append(old)
+                else:
+                    merged.append(n)
             self.nodes = merged
             for domain, node in list(self.current_nodes.items()):
                 if node.key in existing:
@@ -136,6 +142,10 @@ class StickyLatencyPool:
             if current and current.is_available_for(domain, now):
                 return current
         return self.select_best_for(domain)
+
+    def set_current_node(self, domain: str, node: ProxyNode):
+        with self.lock:
+            self.current_nodes[domain] = node
 
     def mark_host_failed(self, node: ProxyNode, domain: str):
         with self.lock:
@@ -323,17 +333,6 @@ class SmartProxyAddon:
                 {"Proxy-Authenticate": 'Basic realm="Smart Proxy"'}
             )
 
-    def server_connect(self, data) -> None:
-        if not data.server.address:
-            return
-        host = data.server.address[0]
-        domain = _extract_root_domain(host)
-        node = pool.get_current_or_best(domain)
-        if node:
-            spec = ServerSpec((node.scheme, (node.host, node.port)))
-            data.server.via = spec
-            ctx.log.info(f"[SmartProxy] Routing server connection for {host} ({domain}) via {node.key}")
-
     def requestheaders(self, flow: http.HTTPFlow) -> None:
         is_authenticated = (flow.client_conn.id in self.authenticated_conns) or _check_auth(flow)
         if not is_authenticated:
@@ -412,6 +411,7 @@ class SmartProxyAddon:
                     flow.response = resp
                     flow.error = None
                     flow.metadata["upstream_proxy"] = next_node
+                    pool.set_current_node(domain, next_node)
                     pool.record_latency(next_node, (time.time() - start_time) * 1000.0)
                     return
                 else:
@@ -456,6 +456,7 @@ class SmartProxyAddon:
                     flow.response = resp
                     flow.error = None
                     flow.metadata["upstream_proxy"] = next_node
+                    pool.set_current_node(domain, next_node)
                     pool.record_latency(next_node, (time.time() - start_time) * 1000.0)
                     return
                 else:
