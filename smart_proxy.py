@@ -354,6 +354,8 @@ class SmartProxyAddon:
         flow.metadata["upstream_proxy"] = node
         flow.metadata["start_time"] = time.time()
         spec = ServerSpec((node.scheme, (node.host, node.port)))
+        if flow.server_conn.via != spec or flow.server_conn.timestamp_start is not None:
+            flow.server_conn = Server(address=flow.server_conn.address)
         flow.server_conn.via = spec
 
     def request(self, flow: http.HTTPFlow) -> None:
