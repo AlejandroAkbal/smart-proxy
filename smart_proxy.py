@@ -314,7 +314,8 @@ class SmartProxyAddon:
 
         if _check_auth(flow):
             self.authenticated_conns.add(flow.client_conn.id)
-            flow.response = http.Response.make(200, b"")
+            # Authenticated: let mitmproxy establish the CONNECT tunnel
+            return
         else:
             flow.response = http.Response.make(
                 407,
