@@ -253,9 +253,7 @@ class SmartProxyAddon:
         flow.metadata["start_time"] = time.time()
         spec = ServerSpec((node.scheme, (node.host, node.port)))
 
-        is_proxy_change = (flow.server_conn.via != spec)
-        server_open = flow.server_conn.timestamp_start is not None
-        if is_proxy_change and server_open:
+        if flow.server_conn.via != spec or flow.server_conn.timestamp_start is not None:
             flow.server_conn = Server(address=flow.server_conn.address)
         flow.server_conn.via = spec
 
@@ -299,6 +297,9 @@ class SmartProxyAddon:
             ctx.log.info(f"[SmartProxy] Detected status {status}/challenge on {method} {flow.request.host}. Rotating {last_failed.key if last_failed else 'none'} -> {next_node.key} (attempt {retries}/{MAX_RETRIES})")
 
             new_flow = flow.copy()
+            new_flow.server_conn = Server(address=flow.server_conn.address)
+            new_flow.response = None
+            new_flow.error = None
             new_flow.metadata["force_proxy"] = next_node
             new_flow.metadata["retry_count"] = retries
 
@@ -361,6 +362,9 @@ class SmartProxyAddon:
             ctx.log.info(f"[SmartProxy] Detected connection error ({flow.error}) on {method} {flow.request.host}. Rotating {last_failed.key if last_failed else 'none'} -> {next_node.key} (attempt {retries}/{MAX_RETRIES})")
 
             new_flow = flow.copy()
+            new_flow.server_conn = Server(address=flow.server_conn.address)
+            new_flow.response = None
+            new_flow.error = None
             new_flow.metadata["force_proxy"] = next_node
             new_flow.metadata["retry_count"] = retries
 
