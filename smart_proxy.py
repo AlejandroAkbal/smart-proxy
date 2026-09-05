@@ -373,22 +373,25 @@ def _fetch_upstream_sync(flow: mitm_http.HTTPFlow, node: ProxyNode, timeout: flo
 
     body = flow.request.content if flow.request.content else None
 
+    conn = None
     try:
         import http.client
         import ssl
 
         conn = http.client.HTTPConnection(node.host, node.port, timeout=timeout)
-        conn.connect()
 
         if is_https:
             tunnel_headers = {}
             if node.auth:
                 tunnel_headers["Proxy-Authorization"] = f"Basic {encoded_auth}"
             conn.set_tunnel(f"{target_host}:{target_port}", headers=tunnel_headers)
+            conn.connect()
             context = ssl.create_default_context()
             context.check_hostname = False
             context.verify_mode = ssl.CERT_NONE
             conn.sock = context.wrap_socket(conn.sock, server_hostname=target_host)
+        else:
+            conn.connect()
 
         req_path = flow.request.url if not is_https else (parsed.path or "/")
         if parsed.query and is_https:
@@ -400,12 +403,18 @@ def _fetch_upstream_sync(flow: mitm_http.HTTPFlow, node: ProxyNode, timeout: flo
         resp_headers = [
             (k.encode("utf-8"), v.encode("utf-8"))
             for k, v in resp.getheaders()
+            if k.lower() not in ("transfer-encoding", "content-length", "connection", "keep-alive", "proxy-authenticate")
         ]
-        conn.close()
         return mitm_http.Response.make(resp.status, content, resp_headers)
     except Exception as e:
         logger.warning(f"[SmartProxy] Replay upstream connection failed to {node.key}: {type(e).__name__}: {e}")
         return None
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 class SmartProxyAddon:

@@ -303,12 +303,16 @@ def run_tests():
     print(f"[2/5] Smart Proxy started on port {PORT_SMART_PROXY} (MAX_RETRIES=5).")
 
     ready = False
-    for _ in range(30):
+    for _ in range(40):
         try:
             s = socket.create_connection(("127.0.0.1", PORT_SMART_PROXY), timeout=1)
             s.close()
-            ready = True
-            break
+            # Test actual proxy response readiness
+            test_opener = urllib.request.build_opener(urllib.request.ProxyHandler({"http": f"http://127.0.0.1:{PORT_SMART_PROXY}"}))
+            test_resp = test_opener.open(f"http://127.0.0.1:{PORT_ORIGIN}/health-ready", timeout=2)
+            if test_resp.status == 200:
+                ready = True
+                break
         except Exception:
             time.sleep(0.3)
 
@@ -459,12 +463,11 @@ if __name__ == "__main__":
     try:
         run_tests()
     except Exception as e:
-        print(f"\n❌ TEST SUITE FAILED: {e}")
+        import traceback
+        traceback.print_exc()
         logs = subprocess.run(["docker", "logs", "smart-proxy-e2e-runner"], capture_output=True, text=True).stdout
         print("\n=== FULL DOCKER LOGS ===")
-        for l in logs.splitlines():
-            if "sim-5-retries" in l or "SmartProxy" in l or "17528" in l or "error" in l.lower():
-                print(l)
+        print(logs)
         print("========================")
         subprocess.run(["docker", "rm", "-f", "smart-proxy-e2e-runner"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         sys.exit(1)
