@@ -210,14 +210,17 @@ def main():
         time.sleep(0.2)
     print(f"[4/6] CA certificate verified ({os.path.getsize(ca_path)} bytes).", flush=True)
 
-    # Wait for smart proxy port
+    # Wait for smart proxy port & addon readiness
     ready = False
-    for _ in range(30):
+    for _ in range(40):
         try:
             s = socket.create_connection(("127.0.0.1", PORT_MITM), timeout=1)
             s.close()
-            ready = True
-            break
+            test_opener = urllib.request.build_opener(urllib.request.ProxyHandler({"http": f"http://127.0.0.1:{PORT_MITM}"}))
+            test_resp = test_opener.open(f"http://127.0.0.1:{PORT_ORIGIN}/health-ready", timeout=2)
+            if test_resp.status == 200:
+                ready = True
+                break
         except Exception:
             time.sleep(0.3)
 

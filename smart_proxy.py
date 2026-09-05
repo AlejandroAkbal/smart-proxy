@@ -96,8 +96,17 @@ class ProxyNode:
         self.ema_latency_ms = (0.25 * duration_ms) + (0.75 * self.ema_latency_ms)
 
     def record_host_failure(self, domain: str):
+        now = time.time()
         self.failure_count += 1
-        self.host_cooldowns[domain] = time.time() + COOLDOWN_SECONDS
+        if len(self.host_cooldowns) >= 500:
+            active = {k: v for k, v in self.host_cooldowns.items() if v > now}
+            if len(active) >= 500:
+                # Evict oldest 100 entries
+                sorted_keys = sorted(active.keys(), key=lambda k: active[k])
+                for k in sorted_keys[:100]:
+                    active.pop(k, None)
+            self.host_cooldowns = active
+        self.host_cooldowns[domain] = now + COOLDOWN_SECONDS
         self.ema_latency_ms += 500.0
 
     def record_global_failure(self):
@@ -149,9 +158,12 @@ class StickyLatencyPool:
                 else:
                     merged.append(n)
             self.nodes = merged
-            for domain, node in list(self.current_nodes.items()):
-                if node.key in existing:
-                    self.current_nodes[domain] = existing[node.key]
+            valid_keys = {n.key for n in self.nodes}
+            self.current_nodes = {
+                d: existing[n.key] if n.key in existing else n
+                for d, n in self.current_nodes.items()
+                if n.key in valid_keys
+            }
 
     def select_best_for(self, domain: str, check_rate_limit: bool = True) -> Optional[ProxyNode]:
         """Picks the lowest latency available node for domain and makes it sticky."""
@@ -408,14 +420,28 @@ def _check_auth(flow: mitm_http.HTTPFlow) -> bool:
 def _extract_sample_body(content: bytes, encoding: Optional[str]) -> bytes:
     if not content:
         return b""
-    if encoding == "gzip":
+    enc = (encoding or "").lower().strip()
+    if enc == "gzip":
         try:
             return gzip.decompress(content)[:16384]
         except Exception:
             pass
-    elif encoding == "deflate":
+    elif enc == "deflate":
         try:
             return zlib.decompress(content)[:16384]
+        except Exception:
+            pass
+    elif enc in ("br", "brotli"):
+        try:
+            import brotli
+            return brotli.decompress(content)[:16384]
+        except Exception:
+            pass
+    elif enc in ("zstd", "zstandard"):
+        try:
+            import zstandard
+            dctx = zstandard.ZstdDecompressor()
+            return dctx.decompress(content, max_output_size=16384)
         except Exception:
             pass
     return content[:16384]
