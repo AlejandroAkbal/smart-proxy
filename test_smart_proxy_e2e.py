@@ -434,8 +434,22 @@ def run_tests():
     assert total_concurrency_time < 5.0
     print("✔ TEST 6 PASSED")
 
+    print("\n" + "-" * 55)
+    print("TEST 7: Cache-Busting Uncached Live Probing Simulation")
+    print("-" * 55)
+    import random
+    uncached_tags = [f"-test{random.randint(100000, 999999)}_{int(time.time())}_{i}" for i in range(5)]
+    for tag in uncached_tags:
+        t0 = time.time()
+        resp = opener.open(f"http://127.0.0.1:{PORT_ORIGIN}/posts?tags={tag}", timeout=5)
+        d = json.loads(resp.read().decode())
+        elapsed = time.time() - t0
+        print(f"Random Negative Tag '{tag}': {d.get('proxy')} | Time: {elapsed:.3f}s | Status: {resp.status}")
+        assert resp.status == 200
+    print("✔ TEST 7 PASSED")
+
     print("\n" + "=" * 65)
-    print("ALL 6 ADVANCED UNLOCKER TESTS PASSED PERFECTLY!")
+    print("ALL 7 ADVANCED UNLOCKER TESTS PASSED PERFECTLY!")
     print("=" * 65)
 
     subprocess.run(["docker", "rm", "-f", "smart-proxy-e2e-runner"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
