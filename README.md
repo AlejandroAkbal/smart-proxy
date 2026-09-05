@@ -26,7 +26,21 @@ export HTTPS_PROXY="http://proxyuser:password@100.101.155.30:8080"
 export REQUESTS_CA_BUNDLE="/path/to/smart-proxy-ca.crt"
 ```
 
-### curl
+## Testing & Quality Assurance
+
+All changes to `smart_proxy.py` or proxy routing MUST pass the test suite before any commit or deployment:
+
 ```bash
-curl -x http://proxyuser:password@100.101.155.30:8080 --cacert /path/to/smart-proxy-ca.crt https://example.com
+# Core Acceptance Suite
+python3 test_smart_proxy_suite.py
+
+# Advanced 5-Retry & Concurrency E2E Suite
+python3 test_smart_proxy_e2e.py
 ```
+
+## Operational Guidelines (Web Unlocker Architecture)
+
+- **Minimum 5 Retries (`MAX_RETRIES=5`)**: Always fail over across at least 5 distinct healthy proxy nodes on status 403/429/500/502/503/504 or anti-bot challenge HTML.
+- **Non-Blocking Async Execution**: Replay loops run asynchronously (`asyncio.to_thread`) to prevent blocking the mitmproxy event loop.
+- **Sticky Affinity with Domain Scoping**: Pin traffic to healthy exits per destination domain until an upstream failure occurs.
+- **Mutation Safety**: Safe methods (`GET`, `HEAD`, `OPTIONS`, `PUT`, `DELETE`) replay automatically; mutations (`POST`) require header `X-Allow-Mutation-Replay: 1`.

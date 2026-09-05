@@ -4,10 +4,10 @@ import http.client
 import urllib.parse
 import urllib.request, urllib.error
 
-PORT_ORIGIN = 29200
-PORT_PROXY_A = 29201
-PORT_PROXY_B = 29202
-PORT_MITM = 29280
+PORT_ORIGIN = 29400
+PORT_PROXY_A = 29401
+PORT_PROXY_B = 29402
+PORT_MITM = 29480
 
 class ReusableServer(ThreadingHTTPServer):
     allow_reuse_address = True
@@ -100,13 +100,16 @@ def pipe_sockets(s1, s2):
     t1.start(); t2.start()
     t1.join(); t2.join()
 
-class ProxyAHandler(BaseHTTPRequestHandler):
+class BaseMockProxyHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    proxy_name = "BaseProxy"
     def log_message(self, format, *args): pass
+
     def do_CONNECT(self):
         host, port = self.path.split(":")
         target_sock = socket.create_connection((host, int(port)), timeout=5)
-        proxy_a_connections.add(target_sock.getsockname()[1])
+        if self.proxy_name == "Proxy-A": proxy_a_connections.add(target_sock.getsockname()[1])
+        else: proxy_b_connections.add(target_sock.getsockname()[1])
         self.send_response(200, "Connection Established")
         self.end_headers()
         pipe_sockets(self.connection, target_sock)
@@ -114,71 +117,56 @@ class ProxyAHandler(BaseHTTPRequestHandler):
 
     def do_GET(self): self._proxy("GET")
     def do_POST(self): self._proxy("POST")
+
     def _proxy(self, method):
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length) if length > 0 else b""
-        parsed = urllib.parse.urlsplit(self.path)
-        conn = http.client.HTTPConnection(parsed.hostname, parsed.port or 80, timeout=5)
-        conn.connect()
-        proxy_a_connections.add(conn.sock.getsockname()[1])
-        headers = {k: v for k, v in self.headers.items() if k.lower() not in ("host", "proxy-connection")}
-        headers["Host"] = parsed.netloc
-        headers["Connection"] = "close"
-        conn.request(method, parsed.path or "/", body=body, headers=headers)
-        res = conn.getresponse()
-        resp_data = res.read()
-        self.send_response(res.status)
-        for k, v in res.getheaders():
-            if k.lower() not in ("content-length", "connection"):
-                self.send_header(k, v)
-        self.send_header("Content-Length", str(len(resp_data)))
-        self.send_header("Connection", "close")
-        self.end_headers()
-        self.wfile.write(resp_data)
+        
+        target_host = "127.0.0.1"
+        target_port = PORT_ORIGIN
+        target_path = self.path
+        
+        if self.path.startswith("http://") or self.path.startswith("https://"):
+            parsed = urllib.parse.urlsplit(self.path)
+            target_host = parsed.hostname or "127.0.0.1"
+            target_port = parsed.port or (443 if parsed.scheme == "https" else 80)
+            target_path = parsed.path or "/"
+            if parsed.query:
+                target_path += "?" + parsed.query
+        
+        conn = socket.create_connection((target_host, target_port), timeout=5)
+        if self.proxy_name == "Proxy-A": proxy_a_connections.add(conn.getsockname()[1])
+        else: proxy_b_connections.add(conn.getsockname()[1])
+        
+        req_lines = [f"{method} {target_path} HTTP/1.1"]
+        for k, v in self.headers.items():
+            if k.lower() not in ("host", "proxy-connection", "connection"):
+                req_lines.append(f"{k}: {v}")
+        req_lines.append(f"Host: {target_host}:{target_port}")
+        req_lines.append("Connection: close\r\n\r\n")
+        conn.sendall("\r\n".join(req_lines).encode("utf-8") + body)
+        
+        resp_data = b""
+        while True:
+            chunk = conn.recv(8192)
+            if not chunk:
+                break
+            resp_data += chunk
         conn.close()
-
-class ProxyBHandler(BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.1"
-    def log_message(self, format, *args): pass
-    def do_CONNECT(self):
-        host, port = self.path.split(":")
-        target_sock = socket.create_connection((host, int(port)), timeout=5)
-        proxy_b_connections.add(target_sock.getsockname()[1])
-        self.send_response(200, "Connection Established")
-        self.end_headers()
-        pipe_sockets(self.connection, target_sock)
+        
+        self.connection.sendall(resp_data)
         self.close_connection = True
 
-    def do_GET(self): self._proxy("GET")
-    def do_POST(self): self._proxy("POST")
-    def _proxy(self, method):
-        length = int(self.headers.get("Content-Length", 0))
-        body = self.rfile.read(length) if length > 0 else b""
-        parsed = urllib.parse.urlsplit(self.path)
-        path = (parsed.path or "/").replace("sim-429", "resolved-by-b").replace("sim-challenge", "resolved-by-b")
-        conn = http.client.HTTPConnection(parsed.hostname, parsed.port or 80, timeout=5)
-        conn.connect()
-        proxy_b_connections.add(conn.sock.getsockname()[1])
-        headers = {k: v for k, v in self.headers.items() if k.lower() not in ("host", "proxy-connection")}
-        headers["Host"] = parsed.netloc
-        headers["Connection"] = "close"
-        conn.request(method, path, body=body, headers=headers)
-        res = conn.getresponse()
-        resp_data = res.read()
-        self.send_response(res.status)
-        for k, v in res.getheaders():
-            if k.lower() not in ("content-length", "connection"):
-                self.send_header(k, v)
-        self.send_header("Content-Length", str(len(resp_data)))
-        self.send_header("Connection", "close")
-        self.end_headers()
-        self.wfile.write(resp_data)
-        conn.close()
+class ProxyAHandler(BaseMockProxyHandler):
+    proxy_name = "Proxy-A"
+
+class ProxyBHandler(BaseMockProxyHandler):
+    proxy_name = "Proxy-B"
 
 def main():
-    s_origin = ReusableServer(("127.0.0.1", PORT_ORIGIN), OriginHandler)
-    s_proxy_a = ReusableServer(("127.0.0.1", PORT_PROXY_A), ProxyAHandler)
-    s_proxy_b = ReusableServer(("127.0.0.1", PORT_PROXY_B), ProxyBHandler)
+    s_origin = ReusableServer(("0.0.0.0", PORT_ORIGIN), OriginHandler)
+    s_proxy_a = ReusableServer(("0.0.0.0", PORT_PROXY_A), ProxyAHandler)
+    s_proxy_b = ReusableServer(("0.0.0.0", PORT_PROXY_B), ProxyBHandler)
     threading.Thread(target=s_origin.serve_forever, daemon=True).start()
     threading.Thread(target=s_proxy_a.serve_forever, daemon=True).start()
     threading.Thread(target=s_proxy_b.serve_forever, daemon=True).start()
@@ -221,6 +209,17 @@ def main():
         if os.path.exists(ca_path) and os.path.getsize(ca_path) > 0: break
         time.sleep(0.2)
     print(f"[4/6] CA certificate verified ({os.path.getsize(ca_path)} bytes).", flush=True)
+
+    # Wait for smart proxy port
+    ready = False
+    for _ in range(30):
+        try:
+            s = socket.create_connection(("127.0.0.1", PORT_MITM), timeout=1)
+            s.close()
+            ready = True
+            break
+        except Exception:
+            time.sleep(0.3)
 
     proxy_handler = urllib.request.ProxyHandler({"http": f"http://127.0.0.1:{PORT_MITM}"})
     opener = urllib.request.build_opener(proxy_handler)

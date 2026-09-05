@@ -16,7 +16,7 @@ from typing import Any, List, Optional, Set, Tuple
 # Reasonable default timeout on socket operations
 socket.setdefaulttimeout(3.0)
 
-from mitmproxy import ctx, http
+from mitmproxy import ctx, http as mitm_http
 from mitmproxy.connection import Server
 from mitmproxy.net.server_spec import ServerSpec
 
@@ -31,7 +31,7 @@ RETRY_STATUSES = {403, 429, 502, 503, 504}
 SAFE_METHODS = {"GET", "HEAD", "OPTIONS", "PUT", "DELETE"}
 
 COOLDOWN_SECONDS = int(os.environ.get("COOLDOWN_SECONDS", "300"))
-MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "2"))
+MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "5"))
 REPLAY_TIMEOUT = float(os.environ.get("REPLAY_TIMEOUT", "2.0"))
 UPSTREAM_CONNECT_TIMEOUT = float(os.environ.get("UPSTREAM_CONNECT_TIMEOUT", "2.0"))
 ADAPTER_URL = os.environ.get("ADAPTER_URL", "").rstrip("/")
@@ -325,7 +325,7 @@ except Exception:
     pass
 
 
-def _check_auth(flow: http.HTTPFlow) -> bool:
+def _check_auth(flow: mitm_http.HTTPFlow) -> bool:
     if not PROXY_AUTH:
         return True
     auth_header = flow.request.headers.get("Proxy-Authorization", "")
@@ -354,39 +354,57 @@ def _extract_sample_body(content: bytes, encoding: Optional[str]) -> bytes:
     return content[:16384]
 
 
-def _fetch_upstream_sync(flow: http.HTTPFlow, node: ProxyNode, timeout: float = REPLAY_TIMEOUT) -> Optional[http.Response]:
+def _fetch_upstream_sync(flow: mitm_http.HTTPFlow, node: ProxyNode, timeout: float = REPLAY_TIMEOUT) -> Optional[mitm_http.Response]:
     """Synchronous worker function run in background executor thread."""
-    proxy_url = node.url_with_auth
-    handler = urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})
-    opener = urllib.request.build_opener(handler)
+    parsed = urllib.parse.urlsplit(flow.request.url)
+    is_https = parsed.scheme == "https"
+    target_host = parsed.hostname
+    target_port = parsed.port or (443 if is_https else 80)
 
     headers = dict(flow.request.headers)
     for h in ["proxy-authorization", "proxy-connection", "connection", "keep-alive", "host", "Host"]:
         headers.pop(h, None)
+    headers["Host"] = target_host
+    headers["Connection"] = "close"
+
+    if node.auth:
+        encoded_auth = base64.b64encode(node.auth.encode()).decode()
+        headers["Proxy-Authorization"] = f"Basic {encoded_auth}"
 
     body = flow.request.content if flow.request.content else None
-    req = urllib.request.Request(
-        flow.request.url,
-        data=body,
-        headers=headers,
-        method=flow.request.method,
-    )
+
     try:
-        with opener.open(req, timeout=timeout) as resp:
-            content = resp.read()
-            resp_headers = [
-                (k.encode("utf-8"), v.encode("utf-8"))
-                for k, v in resp.headers.items()
-            ]
-            return http.Response.make(resp.status, content, resp_headers)
-    except urllib.error.HTTPError as e:
-        content = e.read()
+        import http.client
+        import ssl
+
+        conn = http.client.HTTPConnection(node.host, node.port, timeout=timeout)
+        conn.connect()
+
+        if is_https:
+            tunnel_headers = {}
+            if node.auth:
+                tunnel_headers["Proxy-Authorization"] = f"Basic {encoded_auth}"
+            conn.set_tunnel(f"{target_host}:{target_port}", headers=tunnel_headers)
+            context = ssl.create_default_context()
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+            conn.sock = context.wrap_socket(conn.sock, server_hostname=target_host)
+
+        req_path = flow.request.url if not is_https else (parsed.path or "/")
+        if parsed.query and is_https:
+            req_path += "?" + parsed.query
+
+        conn.request(flow.request.method, req_path, body=body, headers=headers)
+        resp = conn.getresponse()
+        content = resp.read()
         resp_headers = [
             (k.encode("utf-8"), v.encode("utf-8"))
-            for k, v in e.headers.items()
+            for k, v in resp.getheaders()
         ]
-        return http.Response.make(e.code, content, resp_headers)
-    except Exception:
+        conn.close()
+        return mitm_http.Response.make(resp.status, content, resp_headers)
+    except Exception as e:
+        logger.warning(f"[SmartProxy] Replay upstream connection failed to {node.key}: {type(e).__name__}: {e}")
         return None
 
 
@@ -408,10 +426,10 @@ class SmartProxyAddon:
         t.start()
         logger.info("[SmartProxy] Background proxy pool updater started.")
 
-    def client_disconnected(self, client: http.Client) -> None:
+    def client_disconnected(self, client: mitm_http.Client) -> None:
         self.authenticated_conns.discard(client.id)
 
-    def http_connect(self, flow: http.HTTPFlow) -> None:
+    def http_connect(self, flow: mitm_http.HTTPFlow) -> None:
         if not PROXY_AUTH:
             return
 
@@ -419,16 +437,16 @@ class SmartProxyAddon:
             self.authenticated_conns.add(flow.client_conn.id)
             return
         else:
-            flow.response = http.Response.make(
+            flow.response = mitm_http.Response.make(
                 407,
                 b"Proxy Authentication Required\n",
                 {"Proxy-Authenticate": 'Basic realm="Smart Proxy"'},
             )
 
-    def requestheaders(self, flow: http.HTTPFlow) -> None:
+    def requestheaders(self, flow: mitm_http.HTTPFlow) -> None:
         is_authenticated = (flow.client_conn.id in self.authenticated_conns) or _check_auth(flow)
         if not is_authenticated:
-            flow.response = http.Response.make(
+            flow.response = mitm_http.Response.make(
                 407,
                 b"Proxy Authentication Required\n",
                 {"Proxy-Authenticate": 'Basic realm="Smart Proxy"'},
@@ -449,7 +467,7 @@ class SmartProxyAddon:
             flow.server_conn = Server(address=flow.server_conn.address)
         flow.server_conn.via = spec
 
-    def request(self, flow: http.HTTPFlow) -> None:
+    def request(self, flow: mitm_http.HTTPFlow) -> None:
         if flow.response is not None:
             return
         domain = flow.metadata.get("target_domain") or _extract_root_domain(flow.request.pretty_host)
@@ -458,7 +476,7 @@ class SmartProxyAddon:
             spec = ServerSpec((node.scheme, (node.host, node.port)))
             flow.server_conn.via = spec
 
-    async def response(self, flow: http.HTTPFlow) -> None:
+    async def response(self, flow: mitm_http.HTTPFlow) -> None:
         if flow.response is None or flow.is_replay:
             return
 
@@ -480,7 +498,7 @@ class SmartProxyAddon:
         method = flow.request.method.upper()
         allow_replay = (method in SAFE_METHODS) or (flow.request.headers.get("X-Allow-Mutation-Replay") == "1")
         if not allow_replay:
-            ctx.log.warning(
+            logger.warning(
                 f"[SmartProxy] Detected status {status} on unsafe method {method} - not replaying."
             )
             return
@@ -495,7 +513,7 @@ class SmartProxyAddon:
             if not next_node or (next_node == last_failed and pool.count() > 1):
                 break
 
-            ctx.log.info(
+            logger.info(
                 f"[SmartProxy] Detected status {status}/challenge on {method} {flow.request.host} ({domain}). Rotating -> {next_node.key} (attempt {retry_num}/{MAX_RETRIES})"
             )
             resp = await asyncio.to_thread(_fetch_upstream_sync, flow, next_node, timeout=REPLAY_TIMEOUT)
@@ -505,7 +523,7 @@ class SmartProxyAddon:
                 resp_sample = _extract_sample_body(resp_body, resp.headers.get("content-encoding"))
                 resp_blocked = (resp_status in RETRY_STATUSES) or bool(CHALLENGE_RE.search(resp_sample))
                 if not resp_blocked:
-                    ctx.log.info(
+                    logger.info(
                         f"[SmartProxy] Replay success: received status {resp_status} from {next_node.key} for {domain}"
                     )
                     flow.response = resp
@@ -515,18 +533,18 @@ class SmartProxyAddon:
                     pool.record_latency(next_node, (time.time() - start_time) * 1000.0)
                     return
                 else:
-                    ctx.log.warning(
+                    logger.warning(
                         f"[SmartProxy] Replay attempt {retry_num} on {next_node.key} returned status {resp_status}/challenge. Quarantining for {domain}..."
                     )
             else:
-                ctx.log.warning(
+                logger.warning(
                     f"[SmartProxy] Replay attempt {retry_num} on {next_node.key} timed out. Quarantining for {domain}..."
                 )
 
             pool.mark_host_failed(next_node, domain)
             last_failed = next_node
 
-    async def error(self, flow: http.HTTPFlow) -> None:
+    async def error(self, flow: mitm_http.HTTPFlow) -> None:
         if flow.is_replay:
             return
 
@@ -549,7 +567,7 @@ class SmartProxyAddon:
             if not next_node or (next_node == last_failed and pool.count() > 1):
                 break
 
-            ctx.log.info(
+            logger.info(
                 f"[SmartProxy] Connection error on {method} {flow.request.host}. Rotating -> {next_node.key} (attempt {retry_num}/{MAX_RETRIES})"
             )
             resp = await asyncio.to_thread(_fetch_upstream_sync, flow, next_node, timeout=REPLAY_TIMEOUT)
@@ -559,7 +577,7 @@ class SmartProxyAddon:
                 resp_sample = _extract_sample_body(resp_body, resp.headers.get("content-encoding"))
                 resp_blocked = (resp_status in RETRY_STATUSES) or bool(CHALLENGE_RE.search(resp_sample))
                 if not resp_blocked:
-                    ctx.log.info(
+                    logger.info(
                         f"[SmartProxy] Error-recovery success: status {resp_status} from {next_node.key} for {domain}"
                     )
                     flow.response = resp
@@ -569,11 +587,11 @@ class SmartProxyAddon:
                     pool.record_latency(next_node, (time.time() - start_time) * 1000.0)
                     return
                 else:
-                    ctx.log.warning(
+                    logger.warning(
                         f"[SmartProxy] Error-recovery attempt {retry_num} on {next_node.key} returned status {resp_status}. Quarantining globally..."
                     )
             else:
-                ctx.log.warning(
+                logger.warning(
                     f"[SmartProxy] Error-recovery attempt {retry_num} on {next_node.key} timed out. Quarantining globally..."
                 )
 
