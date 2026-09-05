@@ -119,7 +119,12 @@ def _extract_root_domain(host: str) -> str:
     """Extract root domain to group subdomains (e.g. api.e621.net -> e621.net)."""
     if not host:
         return "default"
-    host = host.split(":")[0].lower().strip(".")
+    host = host.lower().strip(".")
+    if host.startswith("["):
+        end = host.find("]")
+        if end != -1:
+            return host[:end+1]
+    host = host.split(":")[0]
     parts = host.split(".")
     if len(parts) == 4 and all(p.isdigit() for p in parts):
         return host
@@ -407,12 +412,16 @@ except Exception:
 def _check_auth(flow: mitm_http.HTTPFlow) -> bool:
     if not PROXY_AUTH:
         return True
-    auth_header = flow.request.headers.get("Proxy-Authorization", "")
-    if not auth_header.startswith("Basic "):
+    auth_header = flow.request.headers.get("Proxy-Authorization", "").strip()
+    if not auth_header:
+        return False
+    parts = auth_header.split(None, 1)
+    if len(parts) != 2 or parts[0].lower() != "basic":
         return False
     try:
-        decoded = base64.b64decode(auth_header[6:].strip()).decode("utf-8")
-        return decoded == PROXY_AUTH
+        decoded = base64.b64decode(parts[1]).decode("utf-8")
+        import hmac
+        return hmac.compare_digest(decoded, PROXY_AUTH)
     except Exception:
         return False
 
@@ -421,16 +430,19 @@ def _extract_sample_body(content: bytes, encoding: Optional[str]) -> bytes:
     if not content:
         return b""
     enc = (encoding or "").lower().strip()
-    if enc == "gzip":
+    if enc in ("gzip", "x-gzip"):
         try:
             return gzip.decompress(content)[:16384]
         except Exception:
             pass
-    elif enc == "deflate":
+    elif enc in ("deflate", "raw-deflate"):
         try:
             return zlib.decompress(content)[:16384]
         except Exception:
-            pass
+            try:
+                return zlib.decompress(content, -zlib.MAX_WBITS)[:16384]
+            except Exception:
+                pass
     elif enc in ("br", "brotli"):
         try:
             import brotli
@@ -447,6 +459,36 @@ def _extract_sample_body(content: bytes, encoding: Optional[str]) -> bytes:
     return content[:16384]
 
 
+def _read_with_deadline(resp: Any, timeout: float, sock: Optional[socket.socket] = None, max_bytes: int = 100 * 1024 * 1024) -> bytes:
+    """Reads response with strict total deadline to prevent Slowloris resource leaks."""
+    deadline = time.time() + timeout
+    chunks = []
+    total_len = 0
+    while True:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            raise TimeoutError("Upstream response read deadline exceeded")
+        if sock:
+            sock.settimeout(max(0.01, remaining))
+        elif hasattr(resp, "fp") and resp.fp:
+            raw_sock = getattr(resp.fp, "raw", None)
+            if raw_sock and hasattr(raw_sock, "_sock") and raw_sock._sock:
+                raw_sock._sock.settimeout(max(0.01, remaining))
+        if getattr(resp, "chunked", False):
+            chunk = resp.read(65536)
+        elif hasattr(resp, "fp") and resp.fp and hasattr(resp.fp, "read1"):
+            chunk = resp.fp.read1(65536)
+        else:
+            chunk = resp.read(65536)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total_len += len(chunk)
+        if total_len > max_bytes:
+            raise ValueError("Response payload exceeds maximum allowed size")
+    return b"".join(chunks)
+
+
 def _fetch_upstream_sync(flow: mitm_http.HTTPFlow, node: ProxyNode, timeout: float = REPLAY_TIMEOUT) -> Optional[mitm_http.Response]:
     """Synchronous worker function run in background executor thread."""
     parsed = urllib.parse.urlsplit(flow.request.url)
@@ -460,9 +502,11 @@ def _fetch_upstream_sync(flow: mitm_http.HTTPFlow, node: ProxyNode, timeout: flo
     headers["Host"] = target_host
     headers["Connection"] = "close"
 
+    encoded_auth = None
     if node.auth:
         encoded_auth = base64.b64encode(node.auth.encode()).decode()
-        headers["Proxy-Authorization"] = f"Basic {encoded_auth}"
+        if not is_https:
+            headers["Proxy-Authorization"] = f"Basic {encoded_auth}"
 
     body = flow.request.content if flow.request.content else None
 
@@ -471,11 +515,14 @@ def _fetch_upstream_sync(flow: mitm_http.HTTPFlow, node: ProxyNode, timeout: flo
         import http.client
         import ssl
 
+        # Allow upstream servers/proxies with extensive header sets
+        http.client._MAXHEADERS = 1000
+
         conn = http.client.HTTPConnection(node.host, node.port, timeout=timeout)
 
         if is_https:
             tunnel_headers = {}
-            if node.auth:
+            if encoded_auth:
                 tunnel_headers["Proxy-Authorization"] = f"Basic {encoded_auth}"
             conn.set_tunnel(f"{target_host}:{target_port}", headers=tunnel_headers)
             conn.connect()
@@ -492,9 +539,9 @@ def _fetch_upstream_sync(flow: mitm_http.HTTPFlow, node: ProxyNode, timeout: flo
 
         conn.request(flow.request.method, req_path, body=body, headers=headers)
         resp = conn.getresponse()
-        content = resp.read()
+        content = _read_with_deadline(resp, timeout=timeout, sock=conn.sock)
         resp_headers = [
-            (k.encode("utf-8"), v.encode("utf-8"))
+            (str(k).encode("utf-8", errors="replace"), str(v).encode("utf-8", errors="replace"))
             for k, v in resp.getheaders()
             if k.lower() not in ("transfer-encoding", "content-length", "connection", "keep-alive", "proxy-authenticate")
         ]
