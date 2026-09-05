@@ -185,19 +185,22 @@ def main():
     print("[1/6] Mock test servers started.", flush=True)
 
     subprocess.run(["docker", "rm", "-f", "smart-proxy-acceptance"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    os.makedirs("/tmp/smart-proxy-prod/ca", exist_ok=True)
-    os.chmod("/tmp/smart-proxy-prod/ca", 0o777)
+    workspace = os.path.dirname(os.path.abspath(__file__))
+    smart_proxy_path = os.path.join(workspace, "smart_proxy.py")
+    ca_dir = "/tmp/smart-proxy-suite-ca"
+    os.makedirs(ca_dir, exist_ok=True)
+    os.chmod(ca_dir, 0o777)
 
     cmd = [
         "docker", "run", "-d", "--name", "smart-proxy-acceptance",
-        "--network", "host",
-        "-v", "/tmp/smart-proxy-prod/smart_proxy.py:/app/smart_proxy.py:ro",
-        "-v", "/tmp/smart-proxy-prod/ca:/ca",
-        "-e", f"UPSTREAM_PROXIES=http://127.0.0.1:{PORT_PROXY_A},http://127.0.0.1:{PORT_PROXY_B}",
+        "-p", f"{PORT_MITM}:8080",
+        "-v", f"{smart_proxy_path}:/app/smart_proxy.py:ro",
+        "-v", f"{ca_dir}:/ca",
+        "-e", f"UPSTREAM_PROXIES=http://host.docker.internal:{PORT_PROXY_A},http://host.docker.internal:{PORT_PROXY_B}",
         "-e", "COOLDOWN_SECONDS=60",
         "mitmproxy/mitmproxy:latest",
         "mitmdump",
-        "-p", str(PORT_MITM),
+        "-p", "8080",
         "-s", "/app/smart_proxy.py",
         "--set", "confdir=/ca",
         "--set", "connection_strategy=lazy",

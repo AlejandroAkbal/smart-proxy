@@ -1,20 +1,22 @@
-import re
-import os
-import time
-import socket
-import logging
-import threading
-import urllib.request
-import urllib.parse
+import asyncio
+import base64
 import gzip
+import logging
+import os
+import re
+import socket
+import threading
+import time
+import urllib.parse
+import urllib.request
 import zlib
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple, Any, cast
+from typing import Any, List, Optional, Set, Tuple
 
-# Reasonable timeout on upstream socket connections to prune completely dead proxies without cutting off slow boorus
-socket.setdefaulttimeout(10.0)
+# Reasonable default timeout on socket operations
+socket.setdefaulttimeout(3.0)
 
-from mitmproxy import http, ctx
+from mitmproxy import ctx, http
 from mitmproxy.connection import Server
 from mitmproxy.net.server_spec import ServerSpec
 
@@ -22,31 +24,51 @@ logger = logging.getLogger("smart_proxy")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 CHALLENGE_RE = re.compile(
-    rb"captcha|cf-chl|challenge-platform|unusual traffic|temporarily blocked|just a moment|security check|cloudflare-static",
-    re.I
+    rb"captcha|cf-chl|challenge-platform|unusual traffic|temporarily blocked|just a moment|security check|cloudflare-static|turnstile",
+    re.I,
 )
-RETRY_STATUSES = {403, 429, 503}
+RETRY_STATUSES = {403, 429, 502, 503, 504}
 SAFE_METHODS = {"GET", "HEAD", "OPTIONS", "PUT", "DELETE"}
+
 COOLDOWN_SECONDS = int(os.environ.get("COOLDOWN_SECONDS", "300"))
-MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "3"))
+MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "2"))
+REPLAY_TIMEOUT = float(os.environ.get("REPLAY_TIMEOUT", "2.0"))
+UPSTREAM_CONNECT_TIMEOUT = float(os.environ.get("UPSTREAM_CONNECT_TIMEOUT", "2.0"))
 ADAPTER_URL = os.environ.get("ADAPTER_URL", "").rstrip("/")
 ADAPTER_REFRESH_INTERVAL = int(os.environ.get("ADAPTER_REFRESH_INTERVAL", "300"))
 PROXY_AUTH = os.environ.get("PROXY_AUTH", "")
+UPSTREAM_PROXIES_ENV = os.environ.get("UPSTREAM_PROXIES", "")
+
+
+RATE_LIMIT_RPS = float(os.environ.get("RATE_LIMIT_RPS", "0"))
+
 
 @dataclass
 class ProxyNode:
-    scheme: str # "http"
+    scheme: str  # "http" | "socks5"
     host: str
     port: int
     auth: Optional[str] = None
     global_cooldown_until: float = 0.0
     host_cooldowns: dict[str, float] = field(default_factory=dict)
-    ema_latency_ms: float = 500.0 # Initial default latency
+    ema_latency_ms: float = 500.0
     success_count: int = 0
     failure_count: int = 0
 
+    # Rate limiting: token bucket
+    tokens: float = 5.0
+    last_token_update: float = field(default_factory=time.time)
+    rate_limit_rps: float = RATE_LIMIT_RPS
+    bucket_capacity: float = 5.0
+
     @property
     def key(self) -> str:
+        return f"{self.scheme}://{self.host}:{self.port}"
+
+    @property
+    def url_with_auth(self) -> str:
+        if self.auth:
+            return f"{self.scheme}://{self.auth}@{self.host}:{self.port}"
         return f"{self.scheme}://{self.host}:{self.port}"
 
     def is_available_for(self, domain: str, now: float) -> bool:
@@ -57,9 +79,20 @@ class ProxyNode:
     def get_effective_cooldown(self, domain: str) -> float:
         return max(self.global_cooldown_until, self.host_cooldowns.get(domain, 0.0))
 
+    def try_consume_token(self) -> bool:
+        if self.rate_limit_rps <= 0:
+            return True
+        now = time.time()
+        elapsed = now - self.last_token_update
+        self.last_token_update = now
+        self.tokens = min(self.bucket_capacity, self.tokens + (elapsed * self.rate_limit_rps))
+        if self.tokens >= 1.0:
+            self.tokens -= 1.0
+            return True
+        return False
+
     def record_success(self, duration_ms: float):
         self.success_count += 1
-        # Exponential moving average with alpha=0.25
         self.ema_latency_ms = (0.25 * duration_ms) + (0.75 * self.ema_latency_ms)
 
     def record_host_failure(self, domain: str):
@@ -71,6 +104,7 @@ class ProxyNode:
         self.failure_count += 1
         self.global_cooldown_until = time.time() + COOLDOWN_SECONDS
         self.ema_latency_ms += 1500.0
+
 
 def _extract_root_domain(host: str) -> str:
     """Extract root domain to group subdomains (e.g. api.e621.net -> e621.net)."""
@@ -86,12 +120,12 @@ def _extract_root_domain(host: str) -> str:
         return ".".join(parts[-3:])
     return ".".join(parts[-2:])
 
+
 class StickyLatencyPool:
     def __init__(self):
         self.lock = threading.Lock()
         self.nodes: List[ProxyNode] = []
-        self.current_nodes: dict[str, ProxyNode] = {} # domain -> sticky ProxyNode
-        self.cursor: int = 0
+        self.current_nodes: dict[str, ProxyNode] = {}  # domain -> sticky ProxyNode
 
     def update_nodes(self, new_nodes: List[ProxyNode]):
         if not new_nodes:
@@ -119,7 +153,7 @@ class StickyLatencyPool:
                 if node.key in existing:
                     self.current_nodes[domain] = existing[node.key]
 
-    def select_best_for(self, domain: str) -> Optional[ProxyNode]:
+    def select_best_for(self, domain: str, check_rate_limit: bool = True) -> Optional[ProxyNode]:
         """Picks the lowest latency available node for domain and makes it sticky."""
         with self.lock:
             if not self.nodes:
@@ -128,21 +162,31 @@ class StickyLatencyPool:
             healthy = [n for n in self.nodes if n.is_available_for(domain, now)]
             if healthy:
                 healthy.sort(key=lambda n: (n.ema_latency_ms, n.failure_count))
-                self.current_nodes[domain] = healthy[0]
-                return healthy[0]
+                if check_rate_limit:
+                    # Pick lowest latency node that has token available
+                    for candidate in healthy:
+                        if candidate.try_consume_token():
+                            self.current_nodes[domain] = candidate
+                            return candidate
+                # If all rate limited or rate check disabled, pick top healthy
+                best = healthy[0]
+                self.current_nodes[domain] = best
+                return best
+            
             # Fallback: if all on cooldown for this domain, pick earliest expiring
             earliest = min(self.nodes, key=lambda n: n.get_effective_cooldown(domain))
             self.current_nodes[domain] = earliest
             return earliest
 
     def get_current_or_best(self, domain: str) -> Optional[ProxyNode]:
-        """Keeps active sticky node for domain if healthy; otherwise picks best."""
+        """Keeps active sticky node for domain if healthy and has token; otherwise selects best."""
         with self.lock:
             now = time.time()
             current = self.current_nodes.get(domain)
             if current and current.is_available_for(domain, now):
-                return current
-        return self.select_best_for(domain)
+                if current.try_consume_token():
+                    return current
+        return self.select_best_for(domain, check_rate_limit=True)
 
     def set_current_node(self, domain: str, node: ProxyNode):
         with self.lock:
@@ -169,7 +213,27 @@ class StickyLatencyPool:
         with self.lock:
             return len(self.nodes)
 
+
 pool = StickyLatencyPool()
+
+
+def _parse_proxy_url(url_str: str) -> Optional[ProxyNode]:
+    try:
+        parsed = urllib.parse.urlsplit(url_str.strip())
+        scheme = parsed.scheme.lower() if parsed.scheme else "http"
+        if scheme not in ("http", "https", "socks5", "socks5h"):
+            scheme = "http"
+        host = parsed.hostname
+        port = parsed.port or (8080 if scheme.startswith("http") else 1080)
+        auth = None
+        if parsed.username or parsed.password:
+            auth = f"{parsed.username or ''}:{parsed.password or ''}"
+        if host and port:
+            return ProxyNode(scheme=scheme, host=host, port=port, auth=auth)
+    except Exception:
+        pass
+    return None
+
 
 def _parse_yaml_proxies(raw_text: str) -> List[ProxyNode]:
     nodes = []
@@ -195,8 +259,10 @@ def _parse_yaml_proxies(raw_text: str) -> List[ProxyNode]:
         elif line.startswith("server:"):
             cur_server = line.split(":", 1)[1].strip().strip("\"'")
         elif line.startswith("port:"):
-            try: cur_port = int(line.split(":", 1)[1].strip().strip("\"'"))
-            except ValueError: pass
+            try:
+                cur_port = int(line.split(":", 1)[1].strip().strip("\"'"))
+            except ValueError:
+                pass
         elif line.startswith("username:"):
             cur_user = line.split(":", 1)[1].strip().strip("\"'")
         elif line.startswith("password:"):
@@ -207,40 +273,57 @@ def _parse_yaml_proxies(raw_text: str) -> List[ProxyNode]:
         nodes.append(ProxyNode(scheme=cur_type, host=cur_server, port=cur_port, auth=auth))
     return nodes
 
-def _refresh_from_adapter():
-    if not ADAPTER_URL:
-        return
-    feeds = ["worldpool.yaml", "proxifly.yaml", "monosans.yaml"]
+
+def _refresh_from_sources():
     all_nodes = []
-    for f in feeds:
-        try:
-            url = f"{ADAPTER_URL}/{f}"
-            req = urllib.request.Request(url, headers={"User-Agent": "SmartProxy"})
-            with urllib.request.urlopen(req, timeout=8) as resp:
-                text = resp.read().decode("utf-8", errors="replace")
-                all_nodes.extend(_parse_yaml_proxies(text))
-        except Exception:
-            pass
+
+    # 1. Direct environment proxy list
+    if UPSTREAM_PROXIES_ENV:
+        for entry in UPSTREAM_PROXIES_ENV.split(","):
+            node = _parse_proxy_url(entry)
+            if node:
+                all_nodes.append(node)
+
+    # 2. Adapter feeds
+    if ADAPTER_URL:
+        feeds = [
+            "worldpool.yaml", "proxifly.yaml", "monosans.yaml",
+            "proxyscrape.yaml", "vakhov.yaml", "iplocate.yaml",
+            "speedx.yaml", "aliilapro.yaml", "hookzof-socks5.yaml",
+            "databay-socks5.yaml", "zaeem-https.yaml", "relayglass-https.yaml"
+        ]
+        for f in feeds:
+            try:
+                url = f"{ADAPTER_URL}/{f}"
+                req = urllib.request.Request(url, headers={"User-Agent": "SmartProxy"})
+                with urllib.request.urlopen(req, timeout=4) as resp:
+                    text = resp.read().decode("utf-8", errors="replace")
+                    all_nodes.extend(_parse_yaml_proxies(text))
+            except Exception:
+                pass
 
     if all_nodes:
-        valid = [n for n in all_nodes if n.scheme == "http"]
+        valid = [n for n in all_nodes if n.scheme in ("http", "socks5", "socks5h")]
         if valid:
             pool.update_nodes(valid)
-            logger.info(f"[SmartProxy] Refreshed pool from adapter: {len(valid)} healthy HTTP nodes.")
+            logger.info(f"[SmartProxy] Refreshed pool from sources: {len(valid)} nodes active.")
+
 
 def _background_updater():
     while True:
         try:
-            _refresh_from_adapter()
+            _refresh_from_sources()
         except Exception as e:
-            logger.warn(f"[SmartProxy] Pool refresh error: {e}")
+            logger.warning(f"[SmartProxy] Pool refresh error: {e}")
         time.sleep(ADAPTER_REFRESH_INTERVAL)
+
 
 # Initial load on import
 try:
-    _refresh_from_adapter()
+    _refresh_from_sources()
 except Exception:
     pass
+
 
 def _check_auth(flow: http.HTTPFlow) -> bool:
     if not PROXY_AUTH:
@@ -249,11 +332,11 @@ def _check_auth(flow: http.HTTPFlow) -> bool:
     if not auth_header.startswith("Basic "):
         return False
     try:
-        import base64
         decoded = base64.b64decode(auth_header[6:].strip()).decode("utf-8")
         return decoded == PROXY_AUTH
     except Exception:
         return False
+
 
 def _extract_sample_body(content: bytes, encoding: Optional[str]) -> bytes:
     if not content:
@@ -271,8 +354,9 @@ def _extract_sample_body(content: bytes, encoding: Optional[str]) -> bytes:
     return content[:16384]
 
 
-def _fetch_upstream(flow: http.HTTPFlow, node: ProxyNode, timeout: float = 6.0) -> Optional[http.Response]:
-    proxy_url = f"{node.scheme}://{node.host}:{node.port}"
+def _fetch_upstream_sync(flow: http.HTTPFlow, node: ProxyNode, timeout: float = REPLAY_TIMEOUT) -> Optional[http.Response]:
+    """Synchronous worker function run in background executor thread."""
+    proxy_url = node.url_with_auth
     handler = urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})
     opener = urllib.request.build_opener(handler)
 
@@ -285,7 +369,7 @@ def _fetch_upstream(flow: http.HTTPFlow, node: ProxyNode, timeout: float = 6.0) 
         flow.request.url,
         data=body,
         headers=headers,
-        method=flow.request.method
+        method=flow.request.method,
     )
     try:
         with opener.open(req, timeout=timeout) as resp:
@@ -308,10 +392,18 @@ def _fetch_upstream(flow: http.HTTPFlow, node: ProxyNode, timeout: float = 6.0) 
 
 class SmartProxyAddon:
     def __init__(self):
-        self.authenticated_conns = set()
+        self.authenticated_conns: Set[str] = set()
+
+    def load(self, loader):
+        loader.add_option(
+            "connection_strategy", str, "lazy", "Mitmproxy connection strategy"
+        )
+        loader.add_option(
+            "connect_timeout", float, UPSTREAM_CONNECT_TIMEOUT, "Upstream connect timeout"
+        )
 
     def running(self) -> None:
-        _refresh_from_adapter()
+        _refresh_from_sources()
         t = threading.Thread(target=_background_updater, daemon=True)
         t.start()
         logger.info("[SmartProxy] Background proxy pool updater started.")
@@ -325,13 +417,12 @@ class SmartProxyAddon:
 
         if _check_auth(flow):
             self.authenticated_conns.add(flow.client_conn.id)
-            # Authenticated: let mitmproxy establish the CONNECT tunnel
             return
         else:
             flow.response = http.Response.make(
                 407,
                 b"Proxy Authentication Required\n",
-                {"Proxy-Authenticate": 'Basic realm="Smart Proxy"'}
+                {"Proxy-Authenticate": 'Basic realm="Smart Proxy"'},
             )
 
     def requestheaders(self, flow: http.HTTPFlow) -> None:
@@ -340,7 +431,7 @@ class SmartProxyAddon:
             flow.response = http.Response.make(
                 407,
                 b"Proxy Authentication Required\n",
-                {"Proxy-Authenticate": 'Basic realm="Smart Proxy"'}
+                {"Proxy-Authenticate": 'Basic realm="Smart Proxy"'},
             )
             return
 
@@ -367,7 +458,7 @@ class SmartProxyAddon:
             spec = ServerSpec((node.scheme, (node.host, node.port)))
             flow.server_conn.via = spec
 
-    def response(self, flow: http.HTTPFlow) -> None:
+    async def response(self, flow: http.HTTPFlow) -> None:
         if flow.response is None or flow.is_replay:
             return
 
@@ -382,7 +473,6 @@ class SmartProxyAddon:
         is_blocked = (status in RETRY_STATUSES) or bool(CHALLENGE_RE.search(sample))
 
         if not is_blocked:
-            # Record successful response latency
             if current_node:
                 pool.record_latency(current_node, duration_ms)
             return
@@ -390,27 +480,34 @@ class SmartProxyAddon:
         method = flow.request.method.upper()
         allow_replay = (method in SAFE_METHODS) or (flow.request.headers.get("X-Allow-Mutation-Replay") == "1")
         if not allow_replay:
-            ctx.log.warn(f"[SmartProxy] Detected status {status} on unsafe method {method} - not replaying to prevent duplicate mutations.")
+            ctx.log.warning(
+                f"[SmartProxy] Detected status {status} on unsafe method {method} - not replaying."
+            )
             return
 
         last_failed = current_node
         if last_failed:
             pool.mark_host_failed(last_failed, domain)
 
+        # Async non-blocking replay loop
         for retry_num in range(1, MAX_RETRIES + 1):
-            next_node = pool.select_best_for(domain)
+            next_node = pool.select_best_for(domain, check_rate_limit=True)
             if not next_node or (next_node == last_failed and pool.count() > 1):
                 break
 
-            ctx.log.info(f"[SmartProxy] Detected status {status}/challenge on {method} {flow.request.host} ({domain}). Rotating {last_failed.key if last_failed else 'none'} -> {next_node.key} (attempt {retry_num}/{MAX_RETRIES})")
-            resp = _fetch_upstream(flow, next_node, timeout=6.0)
+            ctx.log.info(
+                f"[SmartProxy] Detected status {status}/challenge on {method} {flow.request.host} ({domain}). Rotating -> {next_node.key} (attempt {retry_num}/{MAX_RETRIES})"
+            )
+            resp = await asyncio.to_thread(_fetch_upstream_sync, flow, next_node, timeout=REPLAY_TIMEOUT)
             if resp is not None:
                 resp_status = resp.status_code
                 resp_body = resp.content or b""
                 resp_sample = _extract_sample_body(resp_body, resp.headers.get("content-encoding"))
                 resp_blocked = (resp_status in RETRY_STATUSES) or bool(CHALLENGE_RE.search(resp_sample))
                 if not resp_blocked:
-                    ctx.log.info(f"[SmartProxy] Replay success: received status {resp_status} from {next_node.key} for {domain}")
+                    ctx.log.info(
+                        f"[SmartProxy] Replay success: received status {resp_status} from {next_node.key} for {domain}"
+                    )
                     flow.response = resp
                     flow.error = None
                     flow.metadata["upstream_proxy"] = next_node
@@ -418,14 +515,18 @@ class SmartProxyAddon:
                     pool.record_latency(next_node, (time.time() - start_time) * 1000.0)
                     return
                 else:
-                    ctx.log.warn(f"[SmartProxy] Replay attempt {retry_num} on {next_node.key} returned status {resp_status}/challenge. Quarantining for {domain}...")
+                    ctx.log.warning(
+                        f"[SmartProxy] Replay attempt {retry_num} on {next_node.key} returned status {resp_status}/challenge. Quarantining for {domain}..."
+                    )
             else:
-                ctx.log.warn(f"[SmartProxy] Replay attempt {retry_num} on {next_node.key} timed out or connection failed. Quarantining for {domain}...")
+                ctx.log.warning(
+                    f"[SmartProxy] Replay attempt {retry_num} on {next_node.key} timed out. Quarantining for {domain}..."
+                )
 
             pool.mark_host_failed(next_node, domain)
             last_failed = next_node
 
-    def error(self, flow: http.HTTPFlow) -> None:
+    async def error(self, flow: http.HTTPFlow) -> None:
         if flow.is_replay:
             return
 
@@ -442,20 +543,25 @@ class SmartProxyAddon:
         if last_failed:
             pool.mark_global_failed(last_failed)
 
+        # Async non-blocking error recovery loop
         for retry_num in range(1, MAX_RETRIES + 1):
-            next_node = pool.select_best_for(domain)
+            next_node = pool.select_best_for(domain, check_rate_limit=True)
             if not next_node or (next_node == last_failed and pool.count() > 1):
                 break
 
-            ctx.log.info(f"[SmartProxy] Detected connection error ({flow.error}) on {method} {flow.request.host}. Rotating globally {last_failed.key if last_failed else 'none'} -> {next_node.key} (attempt {retry_num}/{MAX_RETRIES})")
-            resp = _fetch_upstream(flow, next_node, timeout=6.0)
+            ctx.log.info(
+                f"[SmartProxy] Connection error on {method} {flow.request.host}. Rotating -> {next_node.key} (attempt {retry_num}/{MAX_RETRIES})"
+            )
+            resp = await asyncio.to_thread(_fetch_upstream_sync, flow, next_node, timeout=REPLAY_TIMEOUT)
             if resp is not None:
                 resp_status = resp.status_code
                 resp_body = resp.content or b""
                 resp_sample = _extract_sample_body(resp_body, resp.headers.get("content-encoding"))
                 resp_blocked = (resp_status in RETRY_STATUSES) or bool(CHALLENGE_RE.search(resp_sample))
                 if not resp_blocked:
-                    ctx.log.info(f"[SmartProxy] Error-recovery success: received status {resp_status} from {next_node.key} for {domain}")
+                    ctx.log.info(
+                        f"[SmartProxy] Error-recovery success: status {resp_status} from {next_node.key} for {domain}"
+                    )
                     flow.response = resp
                     flow.error = None
                     flow.metadata["upstream_proxy"] = next_node
@@ -463,12 +569,16 @@ class SmartProxyAddon:
                     pool.record_latency(next_node, (time.time() - start_time) * 1000.0)
                     return
                 else:
-                    ctx.log.warn(f"[SmartProxy] Error-recovery attempt {retry_num} on {next_node.key} returned status {resp_status}/challenge. Quarantining for {domain}...")
-                    pool.mark_host_failed(next_node, domain)
+                    ctx.log.warning(
+                        f"[SmartProxy] Error-recovery attempt {retry_num} on {next_node.key} returned status {resp_status}. Quarantining globally..."
+                    )
             else:
-                ctx.log.warn(f"[SmartProxy] Error-recovery attempt {retry_num} on {next_node.key} timed out or connection failed. Quarantining globally...")
-                pool.mark_global_failed(next_node)
+                ctx.log.warning(
+                    f"[SmartProxy] Error-recovery attempt {retry_num} on {next_node.key} timed out. Quarantining globally..."
+                )
 
+            pool.mark_global_failed(next_node)
             last_failed = next_node
+
 
 addons = [SmartProxyAddon()]
