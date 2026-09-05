@@ -274,6 +274,61 @@ def _parse_yaml_proxies(raw_text: str) -> List[ProxyNode]:
     return nodes
 
 
+def _probe_node(node: ProxyNode, target_url: str = "https://e621.net/posts.json?limit=1", timeout: float = 1.5) -> Optional[ProxyNode]:
+    """Lightweight pre-flight probe to guarantee node is alive before entering user routing."""
+    parsed = urllib.parse.urlsplit(target_url)
+    is_https = parsed.scheme == "https"
+    target_host = parsed.hostname
+    target_port = parsed.port or (443 if is_https else 80)
+
+    t0 = time.time()
+    conn = None
+    try:
+        import http.client
+        import ssl
+
+        conn = http.client.HTTPConnection(node.host, node.port, timeout=timeout)
+        if is_https:
+            tunnel_headers = {}
+            if node.auth:
+                encoded_auth = base64.b64encode(node.auth.encode()).decode()
+                tunnel_headers["Proxy-Authorization"] = f"Basic {encoded_auth}"
+            conn.set_tunnel(f"{target_host}:{target_port}", headers=tunnel_headers)
+            conn.connect()
+            context = ssl.create_default_context()
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+            conn.sock = context.wrap_socket(conn.sock, server_hostname=target_host)
+        else:
+            conn.connect()
+
+        req_path = target_url if not is_https else (parsed.path or "/")
+        if parsed.query and is_https:
+            req_path += "?" + parsed.query
+
+        headers = {
+            "Host": target_host,
+            "User-Agent": "Universal-Booru-Wrapper/0.15.26 (by AlejandroAkbal on e621)",
+            "Connection": "close",
+        }
+        conn.request("GET", req_path, headers=headers)
+        resp = conn.getresponse()
+        resp.read(1024)
+        duration_ms = (time.time() - t0) * 1000.0
+        if resp.status in (200, 301, 302, 304):
+            node.ema_latency_ms = duration_ms
+            return node
+    except Exception:
+        pass
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    return None
+
+
 def _refresh_from_sources():
     all_nodes = []
 
@@ -303,10 +358,22 @@ def _refresh_from_sources():
                 pass
 
     if all_nodes:
-        valid = [n for n in all_nodes if n.scheme in ("http", "https")]
-        if valid:
-            pool.update_nodes(valid)
-            logger.info(f"[SmartProxy] Refreshed pool from sources: {len(valid)} HTTP nodes active.")
+        valid_raw = [n for n in all_nodes if n.scheme in ("http", "https")]
+        if valid_raw:
+            if UPSTREAM_PROXIES_ENV and not ADAPTER_URL:
+                pool.update_nodes(valid_raw)
+                logger.info(f"[SmartProxy] Test pool loaded: {len(valid_raw)} HTTP nodes active.")
+            else:
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+                    probed = list(executor.map(_probe_node, valid_raw))
+                verified = [n for n in probed if n is not None]
+                if verified:
+                    pool.update_nodes(verified)
+                    logger.info(f"[SmartProxy] Verified pool: {len(verified)}/{len(valid_raw)} healthy nodes active.")
+                else:
+                    pool.update_nodes(valid_raw)
+                    logger.info(f"[SmartProxy] Fallback: {len(valid_raw)} unverified nodes loaded.")
 
 
 def _background_updater():
