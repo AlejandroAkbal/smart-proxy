@@ -303,10 +303,10 @@ def _refresh_from_sources():
                 pass
 
     if all_nodes:
-        valid = [n for n in all_nodes if n.scheme in ("http", "socks5", "socks5h")]
+        valid = [n for n in all_nodes if n.scheme in ("http", "https")]
         if valid:
             pool.update_nodes(valid)
-            logger.info(f"[SmartProxy] Refreshed pool from sources: {len(valid)} nodes active.")
+            logger.info(f"[SmartProxy] Refreshed pool from sources: {len(valid)} HTTP nodes active.")
 
 
 def _background_updater():
