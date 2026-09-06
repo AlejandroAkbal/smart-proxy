@@ -117,7 +117,7 @@ class ProxyNode:
 
 
 def _extract_root_domain(host: str) -> str:
-    """Extract root domain to group subdomains (e.g. api.e621.net -> e621.net)."""
+    """Extract root domain to group subdomains (e.g. api.example.com -> example.com)."""
     if not host:
         return "default"
     host = host.lower().strip(".")
