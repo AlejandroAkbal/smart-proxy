@@ -583,11 +583,11 @@ class SmartProxyAddon:
         if not data.server.address:
             return
         host = data.server.address[0]
+        # In HTTP CONNECT mode, data.server.address is the target host
         domain = _extract_root_domain(host)
         node = pool.get_current_or_best(domain)
         if node:
-            spec = ServerSpec((node.scheme, (node.host, node.port)))
-            data.server.via = spec
+            data.server.via = (node.scheme, (node.host, node.port))
             logger.info(f"[SmartProxy] Routing server connection for {host} ({domain}) via {node.key}")
 
     def requestheaders(self, flow: mitm_http.HTTPFlow) -> None:
