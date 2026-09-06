@@ -566,6 +566,16 @@ class SmartProxyAddon:
         self.authenticated_conns.discard(client.id)
 
     def http_connect(self, flow: mitm_http.HTTPFlow) -> None:
+        domain = _extract_root_domain(flow.request.pretty_host)
+        flow.metadata["target_domain"] = domain
+        node = pool.get_current_or_best(domain)
+        if node:
+            spec = (node.scheme, (node.host, node.port))
+            flow.server_conn.via = spec
+            flow.metadata["upstream_proxy"] = node
+            flow.metadata["start_time"] = time.time()
+            logger.info(f"[SmartProxy] CONNECT {flow.request.pretty_host} ({domain}) routed via {node.key}")
+
         if not PROXY_AUTH:
             return
 
