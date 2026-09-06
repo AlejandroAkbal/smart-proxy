@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import concurrent.futures
 import gzip
 import logging
 import os
@@ -489,6 +490,10 @@ def _read_with_deadline(resp: Any, timeout: float, sock: Optional[socket.socket]
     return b"".join(chunks)
 
 
+# Dedicated persistent executor for async worker offloading
+_WORKER_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=32, thread_name_prefix="smartproxy-worker")
+
+
 def _fetch_upstream_sync(flow: mitm_http.HTTPFlow, node: ProxyNode, timeout: float = REPLAY_TIMEOUT) -> Optional[mitm_http.Response]:
     """Synchronous worker function run in background executor thread."""
     parsed = urllib.parse.urlsplit(flow.request.url)
@@ -665,7 +670,8 @@ class SmartProxyAddon:
             logger.info(
                 f"[SmartProxy] Detected status {status}/challenge on {method} {flow.request.host} ({domain}). Rotating -> {next_node.key} (attempt {retry_num}/{MAX_RETRIES})"
             )
-            resp = await asyncio.to_thread(_fetch_upstream_sync, flow, next_node, timeout=REPLAY_TIMEOUT)
+            loop = asyncio.get_running_loop()
+            resp = await loop.run_in_executor(_WORKER_EXECUTOR, _fetch_upstream_sync, flow, next_node, REPLAY_TIMEOUT)
             if resp is not None:
                 resp_status = resp.status_code
                 resp_body = resp.content or b""
@@ -719,7 +725,8 @@ class SmartProxyAddon:
             logger.info(
                 f"[SmartProxy] Connection error on {method} {flow.request.host}. Rotating -> {next_node.key} (attempt {retry_num}/{MAX_RETRIES})"
             )
-            resp = await asyncio.to_thread(_fetch_upstream_sync, flow, next_node, timeout=REPLAY_TIMEOUT)
+            loop = asyncio.get_running_loop()
+            resp = await loop.run_in_executor(_WORKER_EXECUTOR, _fetch_upstream_sync, flow, next_node, REPLAY_TIMEOUT)
             if resp is not None:
                 resp_status = resp.status_code
                 resp_body = resp.content or b""
