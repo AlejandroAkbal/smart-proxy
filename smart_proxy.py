@@ -192,11 +192,9 @@ class StickyLatencyPool:
                 best = healthy[0]
                 self.current_nodes[domain] = best
                 return best
-            
-            # Fallback: if all on cooldown for this domain, pick earliest expiring
-            earliest = min(self.nodes, key=lambda n: n.get_effective_cooldown(domain))
-            self.current_nodes[domain] = earliest
-            return earliest
+
+            # Fallback: do not reuse dead/cooldown node if other nodes exist
+            return None
 
     def get_current_or_best(self, domain: str) -> Optional[ProxyNode]:
         """Keeps active sticky node for domain if healthy and has token; otherwise selects best."""
