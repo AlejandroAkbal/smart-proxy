@@ -627,7 +627,7 @@ class SmartProxyAddon:
         domain = flow.metadata.get("target_domain") or _extract_root_domain(flow.request.pretty_host)
         node = flow.metadata.get("upstream_proxy") or pool.get_current_or_best(domain)
         if node:
-            spec = (node.scheme, (node.host, node.port))
+            spec = parse(node.key, "http")
             flow.server_conn.via = spec
 
     async def response(self, flow: mitm_http.HTTPFlow) -> None:
