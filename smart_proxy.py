@@ -32,8 +32,8 @@ RETRY_STATUSES = {403, 429, 502, 503, 504}
 SAFE_METHODS = {"GET", "HEAD", "OPTIONS", "PUT", "DELETE"}
 
 COOLDOWN_SECONDS = int(os.environ.get("COOLDOWN_SECONDS", "60"))
-MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "5"))
-REPLAY_TIMEOUT = float(os.environ.get("REPLAY_TIMEOUT", "2.0"))
+MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "3"))
+REPLAY_TIMEOUT = float(os.environ.get("REPLAY_TIMEOUT", "1.5"))
 UPSTREAM_CONNECT_TIMEOUT = float(os.environ.get("UPSTREAM_CONNECT_TIMEOUT", "2.0"))
 ADAPTER_URL = os.environ.get("ADAPTER_URL", "").rstrip("/")
 ADAPTER_REFRESH_INTERVAL = int(os.environ.get("ADAPTER_REFRESH_INTERVAL", "300"))
