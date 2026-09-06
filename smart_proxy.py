@@ -294,44 +294,22 @@ def _parse_yaml_proxies(raw_text: str) -> List[ProxyNode]:
     return nodes
 
 
-def _probe_node(node: ProxyNode, target_url: str = "https://1.1.1.1/cdn-cgi/trace", timeout: float = 2.5) -> Optional[ProxyNode]:
-    """Lightweight pre-flight probe over real HTTPS CONNECT to guarantee node can tunnel TLS before entering user routing."""
-    parsed = urllib.parse.urlsplit(target_url)
-    is_https = parsed.scheme == "https"
-    target_host = parsed.hostname
-    target_port = parsed.port or (443 if is_https else 80)
-
+def _probe_node(node: ProxyNode, target_url: str = "http://cp.cloudflare.com/generate_204", timeout: float = 2.0) -> Optional[ProxyNode]:
+    """Lightweight pre-flight probe over HTTP to verify basic proxy reachability."""
     t0 = time.time()
     conn = None
     try:
         import http.client
-        import ssl
-
         conn = http.client.HTTPConnection(node.host, node.port, timeout=timeout)
-        if is_https:
-            tunnel_headers = {}
-            if node.auth:
-                encoded_auth = base64.b64encode(node.auth.encode()).decode()
-                tunnel_headers["Proxy-Authorization"] = f"Basic {encoded_auth}"
-            conn.set_tunnel(f"{target_host}:{target_port}", headers=tunnel_headers)
-            conn.connect()
-            context = ssl.create_default_context()
-            context.check_hostname = False
-            context.verify_mode = ssl.CERT_NONE
-            conn.sock = context.wrap_socket(conn.sock, server_hostname=target_host)
-        else:
-            conn.connect()
-
-        req_path = target_url if not is_https else (parsed.path or "/")
-        if parsed.query and is_https:
-            req_path += "?" + parsed.query
-
         headers = {
-            "Host": target_host,
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Host": "cp.cloudflare.com",
+            "User-Agent": "Mozilla/5.0",
             "Connection": "close",
         }
-        conn.request("GET", req_path, headers=headers)
+        if node.auth:
+            encoded_auth = base64.b64encode(node.auth.encode()).decode()
+            headers["Proxy-Authorization"] = f"Basic {encoded_auth}"
+        conn.request("GET", "http://cp.cloudflare.com/generate_204", headers=headers)
         resp = conn.getresponse()
         resp.read(1024)
         duration_ms = (time.time() - t0) * 1000.0
