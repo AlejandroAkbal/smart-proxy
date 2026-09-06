@@ -12,12 +12,12 @@ import urllib.parse
 import urllib.request
 import zlib
 from dataclasses import dataclass, field
-from typing import Any, List, Optional, Set, Tuple
+from typing import Any, List, Optional, Set
 
 # Reasonable default timeout on socket operations
 socket.setdefaulttimeout(3.0)
 
-from mitmproxy import ctx, http as mitm_http
+from mitmproxy import http as mitm_http
 from mitmproxy.connection import Server
 from mitmproxy.net.server_spec import ServerSpec
 
