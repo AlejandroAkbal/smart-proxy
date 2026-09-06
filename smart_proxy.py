@@ -579,6 +579,17 @@ class SmartProxyAddon:
                 {"Proxy-Authenticate": 'Basic realm="Smart Proxy"'},
             )
 
+    def server_connect(self, data) -> None:
+        if not data.server.address:
+            return
+        host = data.server.address[0]
+        domain = _extract_root_domain(host)
+        node = pool.get_current_or_best(domain)
+        if node:
+            spec = ServerSpec((node.scheme, (node.host, node.port)))
+            data.server.via = spec
+            logger.info(f"[SmartProxy] Routing server connection for {host} ({domain}) via {node.key}")
+
     def requestheaders(self, flow: mitm_http.HTTPFlow) -> None:
         is_authenticated = (flow.client_conn.id in self.authenticated_conns) or _check_auth(flow)
         if not is_authenticated:
