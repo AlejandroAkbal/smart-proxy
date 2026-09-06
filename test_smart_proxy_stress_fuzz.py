@@ -121,11 +121,13 @@ except ImportError:
 
     spec_mod = type(sys)("mitmproxy.net.server_spec")
     class ServerSpec:
-        def __init__(self, spec):
+        def __init__(self, spec, default_scheme="http"):
             self.spec = spec
+            self.default_scheme = default_scheme
         def __eq__(self, other):
             return isinstance(other, ServerSpec) and self.spec == other.spec
     spec_mod.ServerSpec = ServerSpec
+    spec_mod.parse = lambda spec, default_scheme="http": ServerSpec(spec, default_scheme)
     sys.modules["mitmproxy.net"] = type(sys)("mitmproxy.net")
     sys.modules["mitmproxy.net.server_spec"] = spec_mod
 
