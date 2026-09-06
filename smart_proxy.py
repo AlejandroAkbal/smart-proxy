@@ -600,6 +600,16 @@ class SmartProxyAddon:
             data.server.via = spec
             logger.info(f"[SmartProxy] Routing server connection for {host} ({domain}) via {node.key}")
 
+    def http_connect_upstream(self, flow: mitm_http.HTTPFlow) -> None:
+        if flow.server_conn and flow.server_conn.address:
+            # Add proxy authentication if upstream proxy requires auth
+            for node in pool.nodes:
+                if (node.host, node.port) == flow.server_conn.address:
+                    if node.auth:
+                        encoded = base64.b64encode(node.auth.encode()).decode()
+                        flow.request.headers["Proxy-Authorization"] = f"Basic {encoded}"
+                    break
+
     def requestheaders(self, flow: mitm_http.HTTPFlow) -> None:
         is_authenticated = (flow.client_conn.id in self.authenticated_conns) or _check_auth(flow)
         if not is_authenticated:
