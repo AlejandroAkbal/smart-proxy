@@ -291,8 +291,8 @@ def _parse_yaml_proxies(raw_text: str) -> List[ProxyNode]:
     return nodes
 
 
-def _probe_node(node: ProxyNode, target_url: str = "http://cp.cloudflare.com/generate_204", timeout: float = 2.0) -> Optional[ProxyNode]:
-    """Lightweight pre-flight probe to guarantee node is alive before entering user routing."""
+def _probe_node(node: ProxyNode, target_url: str = "https://1.1.1.1/cdn-cgi/trace", timeout: float = 2.5) -> Optional[ProxyNode]:
+    """Lightweight pre-flight probe over real HTTPS CONNECT to guarantee node can tunnel TLS before entering user routing."""
     parsed = urllib.parse.urlsplit(target_url)
     is_https = parsed.scheme == "https"
     target_host = parsed.hostname
@@ -325,14 +325,14 @@ def _probe_node(node: ProxyNode, target_url: str = "http://cp.cloudflare.com/gen
 
         headers = {
             "Host": target_host,
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
             "Connection": "close",
         }
         conn.request("GET", req_path, headers=headers)
         resp = conn.getresponse()
         resp.read(1024)
         duration_ms = (time.time() - t0) * 1000.0
-        if resp.status in (200, 204, 301, 302, 304):
+        if resp.status in (200, 204, 301, 302, 304, 403, 429):
             node.ema_latency_ms = duration_ms
             return node
     except Exception:
