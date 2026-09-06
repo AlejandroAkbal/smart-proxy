@@ -294,24 +294,28 @@ def _parse_yaml_proxies(raw_text: str) -> List[ProxyNode]:
     return nodes
 
 
-def _probe_node(node: ProxyNode, target_url: str = "http://cp.cloudflare.com/generate_204", timeout: float = 2.0) -> Optional[ProxyNode]:
-    """Lightweight pre-flight probe over HTTP to verify basic proxy reachability."""
+def _probe_node(node: ProxyNode, target_url: str = "https://cp.cloudflare.com/generate_204", timeout: float = 1.2) -> Optional[ProxyNode]:
+    """Fast pre-flight probe testing real HTTPS CONNECT tunnel within 1.2s."""
     t0 = time.time()
     conn = None
     try:
         import http.client
+        import ssl
+
         conn = http.client.HTTPConnection(node.host, node.port, timeout=timeout)
-        headers = {
-            "Host": "cp.cloudflare.com",
-            "User-Agent": "Mozilla/5.0",
-            "Connection": "close",
-        }
+        tunnel_headers = {}
         if node.auth:
             encoded_auth = base64.b64encode(node.auth.encode()).decode()
-            headers["Proxy-Authorization"] = f"Basic {encoded_auth}"
-        conn.request("GET", "http://cp.cloudflare.com/generate_204", headers=headers)
+            tunnel_headers["Proxy-Authorization"] = f"Basic {encoded_auth}"
+        conn.set_tunnel("cp.cloudflare.com:443", headers=tunnel_headers)
+        conn.connect()
+        context = ssl.create_default_context()
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        conn.sock = context.wrap_socket(conn.sock, server_hostname="cp.cloudflare.com")
+        conn.request("GET", "/generate_204", headers={"Host": "cp.cloudflare.com", "Connection": "close"})
         resp = conn.getresponse()
-        resp.read(1024)
+        resp.read(512)
         duration_ms = (time.time() - t0) * 1000.0
         if resp.status in (200, 204, 301, 302, 304, 403, 429):
             node.ema_latency_ms = duration_ms
