@@ -14,8 +14,8 @@ import zlib
 from dataclasses import dataclass, field
 from typing import Any, List, Optional, Set
 
-# Reasonable default timeout on socket operations
-socket.setdefaulttimeout(3.0)
+# Reasonable default timeout on socket operations for slow booru backends
+socket.setdefaulttimeout(20.0)
 
 from mitmproxy import http as mitm_http
 from mitmproxy.connection import Server
@@ -33,8 +33,8 @@ SAFE_METHODS = {"GET", "HEAD", "OPTIONS", "PUT", "DELETE"}
 
 COOLDOWN_SECONDS = int(os.environ.get("COOLDOWN_SECONDS", "60"))
 MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "3"))
-REPLAY_TIMEOUT = float(os.environ.get("REPLAY_TIMEOUT", "1.5"))
-UPSTREAM_CONNECT_TIMEOUT = float(os.environ.get("UPSTREAM_CONNECT_TIMEOUT", "2.0"))
+REPLAY_TIMEOUT = float(os.environ.get("REPLAY_TIMEOUT", "20.0"))
+UPSTREAM_CONNECT_TIMEOUT = float(os.environ.get("UPSTREAM_CONNECT_TIMEOUT", "10.0"))
 ADAPTER_URL = os.environ.get("ADAPTER_URL", "").rstrip("/")
 ADAPTER_REFRESH_INTERVAL = int(os.environ.get("ADAPTER_REFRESH_INTERVAL", "300"))
 PROXY_AUTH = os.environ.get("PROXY_AUTH", "")
