@@ -31,7 +31,7 @@ CHALLENGE_RE = re.compile(
 RETRY_STATUSES = {403, 429, 502, 503, 504}
 SAFE_METHODS = {"GET", "HEAD", "OPTIONS", "PUT", "DELETE"}
 
-COOLDOWN_SECONDS = int(os.environ.get("COOLDOWN_SECONDS", "300"))
+COOLDOWN_SECONDS = int(os.environ.get("COOLDOWN_SECONDS", "60"))
 MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "5"))
 REPLAY_TIMEOUT = float(os.environ.get("REPLAY_TIMEOUT", "2.0"))
 UPSTREAM_CONNECT_TIMEOUT = float(os.environ.get("UPSTREAM_CONNECT_TIMEOUT", "2.0"))
@@ -193,8 +193,8 @@ class StickyLatencyPool:
                 self.current_nodes[domain] = best
                 return best
 
-            # Fallback: do not reuse dead/cooldown node if other nodes exist
-            return None
+            # Fallback: if all on cooldown for this domain, pick earliest expiring
+            return min(self.nodes, key=lambda n: n.get_effective_cooldown(domain))
 
     def get_current_or_best(self, domain: str) -> Optional[ProxyNode]:
         """Keeps active sticky node for domain if healthy and has token; otherwise selects best."""
