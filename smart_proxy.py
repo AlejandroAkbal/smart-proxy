@@ -19,7 +19,7 @@ socket.setdefaulttimeout(3.0)
 
 from mitmproxy import http as mitm_http
 from mitmproxy.connection import Server
-from mitmproxy.net.server_spec import ServerSpec
+from mitmproxy.net.server_spec import ServerSpec, parse
 
 logger = logging.getLogger("smart_proxy")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -596,8 +596,7 @@ class SmartProxyAddon:
             domain = _extract_root_domain(host)
             node = pool.get_current_or_best(domain)
             if node:
-                spec = (node.scheme, (node.host, node.port))
-                context.server.via = spec
+                context.server.via = parse(node.key, "http")
                 logger.info(f"[SmartProxy] next_layer set server.via for {host} ({domain}) -> {node.key}")
 
     def requestheaders(self, flow: mitm_http.HTTPFlow) -> None:
@@ -619,7 +618,7 @@ class SmartProxyAddon:
 
         flow.metadata["upstream_proxy"] = node
         flow.metadata["start_time"] = time.time()
-        spec = (node.scheme, (node.host, node.port))
+        spec = parse(node.key, "http")
         flow.server_conn.via = spec
         flow.server_conn.address = (flow.request.host, flow.request.port)
 
