@@ -291,7 +291,7 @@ def _parse_yaml_proxies(raw_text: str) -> List[ProxyNode]:
     return nodes
 
 
-def _probe_node(node: ProxyNode, target_url: str = "https://e621.net/posts.json?limit=1", timeout: float = 1.5) -> Optional[ProxyNode]:
+def _probe_node(node: ProxyNode, target_url: str = "http://cp.cloudflare.com/generate_204", timeout: float = 2.0) -> Optional[ProxyNode]:
     """Lightweight pre-flight probe to guarantee node is alive before entering user routing."""
     parsed = urllib.parse.urlsplit(target_url)
     is_https = parsed.scheme == "https"
@@ -325,20 +325,20 @@ def _probe_node(node: ProxyNode, target_url: str = "https://e621.net/posts.json?
 
         headers = {
             "Host": target_host,
-            "User-Agent": "Universal-Booru-Wrapper/0.15.26 (by AlejandroAkbal on e621)",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "Connection": "close",
         }
         conn.request("GET", req_path, headers=headers)
         resp = conn.getresponse()
         resp.read(1024)
         duration_ms = (time.time() - t0) * 1000.0
-        if resp.status in (200, 301, 302, 304):
+        if resp.status in (200, 204, 301, 302, 304):
             node.ema_latency_ms = duration_ms
             return node
     except Exception:
         pass
     finally:
-        if conn is not None:
+        if conn:
             try:
                 conn.close()
             except Exception:
