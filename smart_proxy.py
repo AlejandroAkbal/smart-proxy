@@ -160,6 +160,8 @@ class StickyLatencyPool:
                     old.host = n.host
                     old.port = n.port
                     old.auth = n.auth
+                    old.ema_latency_ms = n.ema_latency_ms
+                    old.global_cooldown_until = 0.0  # Reset cooldown since it passed pre-flight probe
                     merged.append(old)
                 else:
                     merged.append(n)
