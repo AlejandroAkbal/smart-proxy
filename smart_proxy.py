@@ -570,8 +570,7 @@ class SmartProxyAddon:
         flow.metadata["target_domain"] = domain
         node = pool.get_current_or_best(domain)
         if node:
-            spec = (node.scheme, (node.host, node.port))
-            flow.server_conn.via = spec
+            flow.server_conn.via = parse(node.key, "http")
             flow.metadata["upstream_proxy"] = node
             flow.metadata["start_time"] = time.time()
             logger.info(f"[SmartProxy] CONNECT {flow.request.pretty_host} ({domain}) routed via {node.key}")
