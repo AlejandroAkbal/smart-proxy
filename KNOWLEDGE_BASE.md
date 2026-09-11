@@ -121,3 +121,55 @@ Request ────► [ Layer 1: Cloudflare WAF ] ────► [ Layer 2: e
 ### 5.3 Network Topology & Firewalling
 - **Private Endpoint**: Bound internally to Tailscale (`100.101.155.30:8088` / `http://hosting-eu:8088`).
 - **Public Endpoint**: Exposed on port `24000` with basic authentication (`smart-proxy.akbal.dev:24000`), requiring `--set block_global=false` in mitmdump to permit public clients.
+
+---
+
+## 6. Performance Baselines & Latency Profiles
+
+*Benchmarks conducted on 2026-09-11 across live fleet infrastructure (`fe167f365cbf` on `hetzner-de-2`, `hosting-eu`, and residential/VPS baselines).*
+
+### 6.1 Backend API & Smart Proxy Latencies
+
+| Endpoint / Provider | Query Type | Avg Latency | Min Latency | Max Latency | Status | Pipeline Route |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **e621.net** | Simple (`limit=1`) | **659 ms** | 628 ms | 690 ms | `200 OK` | Smart Proxy (Sticky exit) |
+| **e621.net** | Complex (`-pokemon_(species)&score:>=50`) | **6,171 ms** | 1,522 ms | 10,820 ms | `200 OK` | Smart Proxy (Sticky exit) |
+| **e621.net** | Tags Lookup (`tag=dragon&limit=2`) | **5,989 ms** | 598 ms | 11,381 ms | `200 OK` | Smart Proxy (Sticky exit) |
+| **e926.net** | Simple (`limit=1`) | **1,007 ms** | 719 ms | 1,295 ms | `200 OK` | Smart Proxy (Sticky exit) |
+| **danbooru.donmai.us** | Simple (`limit=1`) | **164 ms** | 157 ms | 171 ms | `200 OK` | Direct Egress (API auth) |
+| **rule34.xxx** | Simple (`limit=1`) | **57 ms** | 56 ms | 59 ms | `200 OK` | Direct Egress (API auth) |
+| **safebooru.org** | Simple (`limit=1`) | **36 ms** | 35 ms | 38 ms | `200 OK` | Direct Egress (Gelbooru engine) |
+| **gelbooru.com** | Simple (`limit=1`) | **1,095 ms** | 944 ms | 1,245 ms | `200 OK` | Direct Egress (Gelbooru engine) |
+| **rule34.paheal.net** | Simple (`limit=1`) | **68 ms** | 65 ms | 71 ms | `200 OK` | CF Worker Proxy |
+| **realbooru.com** | Simple (`limit=1`) | **311 ms** | 310 ms | 313 ms | `200 OK` | Direct Egress (Gelbooru engine) |
+
+### 6.2 Raw Direct Upstream Baselines (No Proxy, Unblocked Network)
+
+| Upstream Target | Raw Avg | Raw Min | Raw Max | Raw Direct Status | Datacenter Direct Status |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **e621.net (simple)** | **470.8 ms** | 304.7 ms | 560.6 ms | `200 OK` | `403 Forbidden` (Cloudflare blocked) |
+| **e621.net (heavy)** | **527.0 ms** | 452.3 ms | 593.0 ms | `200 OK` | `403 Forbidden` (Cloudflare blocked) |
+| **rule34.xxx** | **35.7 ms** | 30.6 ms | 43.9 ms | `200 OK` | `200 OK` |
+| **safebooru.org** | **54.2 ms** | 21.6 ms | 60.5 ms | `200 OK` | `200 OK` |
+| **rule34.paheal.net** | **115.6 ms** | 103.5 ms | 137.5 ms | `200 OK` | `200 OK` |
+| **realbooru.com** | **307.7 ms** | 302.4 ms | 317.4 ms | `200 OK` | `200 OK` |
+
+### 6.3 Frontend SSR Latencies (`r34.app` via Edge)
+
+| Route | Avg Latency | Min Latency | Max Latency | Status | Response Size |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| `r34.app/posts/e621.net` (uncached tags + score) | **200 ms** | 195 ms | 205 ms | `200 OK` | ~135 KB HTML |
+| `r34.app/posts/danbooru.donmai.us` | **253 ms** | 239 ms | 266 ms | `200 OK` | ~134 KB HTML |
+| `r34.app/posts/rule34.xxx` | **163 ms** | 157 ms | 169 ms | `200 OK` | ~133 KB HTML |
+
+---
+
+## 7. Upstream Replay Decompression & Encoding Hygiene
+
+### 7.1 The Raw Gzip Replay Trap
+- **Bug**: When `smart_proxy.py` replays an in-flight request via `_fetch_upstream_sync` over `urllib`, the raw socket payload bytes may arrive compressed (`Content-Encoding: gzip` / `deflate` / `br` / `zstd`).
+- If `mitmproxy.http.Response.make(status_code, raw_bytes, headers)` is instantiated with already-gzipped bytes while preserving `Content-Encoding: gzip`, mitmproxy or the downstream HTTP client may attempt duplicate decompression or pass compressed binary to application JSON parsers (`SyntaxError: Unexpected token ' '`).
+- **Fix**: 
+  1. `_decompress_body(raw_bytes, encoding)` is explicitly invoked inside `_fetch_upstream_sync` to decompress `gzip`, `deflate`, `br`, and `zstd` payloads into plain plaintext/bytes.
+  2. Hop-by-hop and encoding headers (`Content-Encoding`, `Transfer-Encoding`, `Content-Length`) are stripped before calling `Response.make()`, allowing mitmproxy to set clean chunked/length framing downstream.
+
