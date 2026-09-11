@@ -409,6 +409,39 @@ def _check_auth(flow: mitm_http.HTTPFlow) -> bool:
         return False
 
 
+def _decompress_body(content: bytes, encoding: Optional[str]) -> bytes:
+    if not content:
+        return b""
+    enc = (encoding or "").lower().strip()
+    if enc in ("gzip", "x-gzip"):
+        try:
+            return gzip.decompress(content)
+        except Exception:
+            return content
+    elif enc in ("deflate", "raw-deflate"):
+        try:
+            return zlib.decompress(content)
+        except Exception:
+            try:
+                return zlib.decompress(content, -zlib.MAX_WBITS)
+            except Exception:
+                return content
+    elif enc in ("br", "brotli"):
+        try:
+            import brotli
+            return brotli.decompress(content)
+        except Exception:
+            return content
+    elif enc in ("zstd", "zstandard"):
+        try:
+            import zstandard
+            dctx = zstandard.ZstdDecompressor()
+            return dctx.decompress(content)
+        except Exception:
+            return content
+    return content
+
+
 def _extract_sample_body(content: bytes, encoding: Optional[str]) -> bytes:
     if not content:
         return b""
@@ -526,11 +559,16 @@ def _fetch_upstream_sync(flow: mitm_http.HTTPFlow, node: ProxyNode, timeout: flo
 
         conn.request(flow.request.method, req_path, body=body, headers=headers)
         resp = conn.getresponse()
-        content = _read_with_deadline(resp, timeout=timeout, sock=conn.sock)
+        raw_content = _read_with_deadline(resp, timeout=timeout, sock=conn.sock)
+        enc_header = resp.getheader("content-encoding")
+        content = _decompress_body(raw_content, enc_header)
         resp_headers = [
             (str(k).encode("utf-8", errors="replace"), str(v).encode("utf-8", errors="replace"))
             for k, v in resp.getheaders()
-            if k.lower() not in ("transfer-encoding", "content-length", "connection", "keep-alive", "proxy-authenticate")
+            if k.lower() not in (
+                "transfer-encoding", "content-length", "content-encoding",
+                "connection", "keep-alive", "proxy-authenticate"
+            )
         ]
         return mitm_http.Response.make(resp.status, content, resp_headers)
     except Exception as e:

@@ -222,12 +222,14 @@ def test_chunked_framing_mismatch():
     # Body is decoded to b"helloworld"
     assert resp.content == b"helloworld", f"Unexpected body: {resp.content}"
     
-    # Headers check: Transfer-Encoding must NOT be present if body is already decoded!
+    # Headers check: Transfer-Encoding and Content-Encoding must NOT be present if body is already decoded!
     headers_dict = {k.lower(): v for k, v in resp.headers.items()}
     
     issues = []
     if "transfer-encoding" in headers_dict:
         issues.append(f"Transfer-Encoding: {headers_dict['transfer-encoding']} leaked downstream with decoded body!")
+    if "content-encoding" in headers_dict:
+        issues.append(f"Content-Encoding: {headers_dict['content-encoding']} leaked downstream with decoded body!")
     if "connection" in headers_dict:
         issues.append(f"Hop-by-hop Connection header leaked downstream: {headers_dict['connection']}")
     if "keep-alive" in headers_dict:
