@@ -38,8 +38,35 @@ except ImportError:
     mitm_connection.Client = MagicMock
     mitm_spec.ServerSpec = MagicMock
     mitm_spec.parse = lambda s, scheme="http": s
-    mitm_http.Response = MagicMock
+    class MockResponse:
+        def __init__(self, status_code=200, content=b"", headers=None):
+            self.status_code = status_code
+            self.content = content
+            h_dict = {}
+            if isinstance(headers, list):
+                for k, v in headers:
+                    k_str = k.decode() if isinstance(k, bytes) else str(k)
+                    v_str = v.decode() if isinstance(v, bytes) else str(v)
+                    h_dict[k_str] = v_str
+            elif isinstance(headers, dict):
+                h_dict = headers
+            self.headers = h_dict
+
+        @classmethod
+        def make(cls, status_code, content=b"", headers=None):
+            return cls(status_code=status_code, content=content, headers=headers)
+
+    mitm_http.Response = MockResponse
     mitm_http.HTTPFlow = MagicMock
+    class MockRequest:
+        def __init__(self, method="GET", url="http://example.com/test", headers=None, content=b""):
+            self.method = method
+            self.url = url
+            self.headers = headers or {}
+            self.content = content
+            self.host = "example.com"
+            self.pretty_host = "example.com"
+    mitm_http.Request = MockRequest
 
 # Import smart_proxy module
 import smart_proxy
@@ -196,9 +223,9 @@ class TestResilienceAndFraming(unittest.TestCase):
         self.assertEqual(s2.fileno(), -1)
 
     def test_timeout_constants(self):
-        """Verify SLA constants match user instruction: 29.0s global, 12.0s initial."""
-        self.assertEqual(GLOBAL_REQUEST_TIMEOUT, 29.0)
-        self.assertEqual(INITIAL_REQUEST_TIMEOUT, 12.0)
+        """Verify SLA constants match user instruction: 60.0s global, 15.0s initial."""
+        self.assertEqual(GLOBAL_REQUEST_TIMEOUT, 60.0)
+        self.assertEqual(INITIAL_REQUEST_TIMEOUT, 15.0)
         self.assertEqual(MAX_DECOMPRESSED_BYTES, 20 * 1024 * 1024)
 
     def test_soft_latency_reranking_small_absolute_delta(self):
@@ -224,6 +251,84 @@ class TestResilienceAndFraming(unittest.TestCase):
         # malformed gzip returns ok=False
         self.assertFalse(ok)
         self.assertEqual(body, origin_payload)
+
+    def test_budget_driven_retry_exhaustion_bounds(self):
+        """Verify that when all healthy nodes are tried, retry loop breaks cleanly without looping infinitely."""
+        import smart_proxy
+        from smart_proxy import pool as global_pool, ProxyNode as Node, SmartProxyAddon
+
+        n1 = Node('http', '10.0.0.1', 8080)
+        n2 = Node('http', '10.0.0.2', 8080)
+        n3 = Node('http', '10.0.0.3', 8080)
+        n3.global_cooldown_until = time.time() + 100.0  # unavailable
+
+        global_pool.nodes = []
+        global_pool.current_nodes.clear()
+        global_pool.update_nodes([n1, n2, n3])
+        addon = SmartProxyAddon()
+
+        flow = MagicMock()
+        flow.request.method = 'GET'
+        flow.request.pretty_host = 'danbooru.donmai.us'
+        flow.request.url = 'https://danbooru.donmai.us/posts.json'
+        flow.request.headers = {}
+        flow.metadata = {}
+        flow.response = None
+        flow.client_conn = MagicMock(connected=True, id='c1')
+
+        attempts = []
+        orig_fetch = smart_proxy._fetch_upstream_sync
+
+        def mock_fetch(f, node, timeout):
+            attempts.append(node.key)
+            resp = MagicMock(status_code=503, content=b'503 Service Unavailable', headers={'content-type': 'text/plain'})
+            return resp
+
+        smart_proxy._fetch_upstream_sync = mock_fetch
+        try:
+            asyncio.run(addon.request(flow))
+        finally:
+            smart_proxy._fetch_upstream_sync = orig_fetch
+
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(flow.response.status_code, 503)
+
+    def test_budget_driven_retry_all_connection_failures_returns_504(self):
+        """Verify that when all healthy nodes hit connection timeout, proxy terminates and returns 504."""
+        import smart_proxy
+        from smart_proxy import pool as global_pool, ProxyNode as Node, SmartProxyAddon
+
+        n1 = Node('http', '10.0.0.1', 8080)
+        n2 = Node('http', '10.0.0.2', 8080)
+        global_pool.nodes = []
+        global_pool.current_nodes.clear()
+        global_pool.update_nodes([n1, n2])
+        addon = SmartProxyAddon()
+
+        flow = MagicMock()
+        flow.request.method = 'GET'
+        flow.request.pretty_host = 'danbooru.donmai.us'
+        flow.request.url = 'https://danbooru.donmai.us/posts.json'
+        flow.request.headers = {}
+        flow.metadata = {}
+        flow.response = None
+        flow.client_conn = MagicMock(connected=True, id='c2')
+
+        attempts = []
+        orig_fetch = smart_proxy._fetch_upstream_sync
+
+        def mock_fetch(f, node, timeout):
+            attempts.append(node.key)
+            return None
+
+        smart_proxy._fetch_upstream_sync = mock_fetch
+        try:
+            asyncio.run(addon.request(flow))
+        finally:
+            smart_proxy._fetch_upstream_sync = orig_fetch
+
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(flow.response.status_code, 504)
 
 
 if __name__ == "__main__":

@@ -16,11 +16,11 @@ from dataclasses import dataclass, field
 from typing import Any, List, Optional, Set
 
 # Reasonable default timeout on socket operations for slow booru backends
-socket.setdefaulttimeout(12.0)
+socket.setdefaulttimeout(15.0)
 
 from mitmproxy import http as mitm_http
 from mitmproxy.connection import Client, Server
-from mitmproxy.net.server_spec import ServerSpec, parse
+from mitmproxy.net.server_spec import parse
 
 logger = logging.getLogger("smart_proxy")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -33,12 +33,13 @@ RETRY_STATUSES = {403, 429, 502, 503, 504}
 SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
 
 COOLDOWN_SECONDS = int(os.environ.get("COOLDOWN_SECONDS", "60"))
-MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "3"))
+# Legacy parameter kept for backward-compatibility; retry loop is purely budget-driven
+MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "10"))
 
-# Strict end-to-end deadline budget and timeouts (user SLA: 29s global budget, 12s initial attempt)
-GLOBAL_REQUEST_TIMEOUT = float(os.environ.get("GLOBAL_REQUEST_TIMEOUT", "29.0"))
-INITIAL_REQUEST_TIMEOUT = float(os.environ.get("INITIAL_REQUEST_TIMEOUT", "12.0"))
-REPLAY_TIMEOUT = float(os.environ.get("REPLAY_TIMEOUT", "12.0"))
+# Strict end-to-end deadline budget and timeouts (user SLA: 60s global budget, 15s initial attempt)
+GLOBAL_REQUEST_TIMEOUT = float(os.environ.get("GLOBAL_REQUEST_TIMEOUT", "60.0"))
+INITIAL_REQUEST_TIMEOUT = float(os.environ.get("INITIAL_REQUEST_TIMEOUT", "15.0"))
+REPLAY_TIMEOUT = float(os.environ.get("REPLAY_TIMEOUT", "15.0"))
 UPSTREAM_CONNECT_TIMEOUT = float(os.environ.get("UPSTREAM_CONNECT_TIMEOUT", "10.0"))
 MAX_DECOMPRESSED_BYTES = int(os.environ.get("MAX_DECOMPRESSED_BYTES", str(20 * 1024 * 1024)))
 ADAPTER_URL = os.environ.get("ADAPTER_URL", "").rstrip("/")
@@ -234,6 +235,37 @@ class StickyLatencyPool:
                 if current.try_consume_token():
                     return current
         return self.select_best_for(domain, check_rate_limit=True)
+
+    def has_untried_healthy(self, domain: str, tried_keys: Set[str]) -> bool:
+        """Returns True if there is at least one healthy, untried candidate for domain."""
+        with self.lock:
+            now = time.time()
+            return any(
+                n.key not in tried_keys and n.is_available_for(domain, now)
+                for n in self.nodes
+            )
+
+    def select_candidate_for(
+        self, domain: str, exclude_keys: Optional[Set[str]] = None, check_rate_limit: bool = True
+    ) -> Optional[ProxyNode]:
+        """Picks the best untried candidate node for domain during a request attempt chain."""
+        with self.lock:
+            if not self.nodes:
+                return None
+            exclude = exclude_keys or set()
+            now = time.time()
+            healthy = [
+                n for n in self.nodes
+                if n.key not in exclude and n.is_available_for(domain, now)
+            ]
+            if healthy:
+                healthy.sort(key=lambda n: (n.ema_latency_ms, n.failure_count))
+                if check_rate_limit:
+                    for candidate in healthy:
+                        if candidate.try_consume_token():
+                            return candidate
+                return healthy[0]
+            return None
 
     def set_current_node(self, domain: str, node: ProxyNode):
         with self.lock:
@@ -832,8 +864,11 @@ class SmartProxyAddon:
         flow.metadata["start_time"] = start_time
 
         last_failed: Optional[ProxyNode] = None
+        attempt = 0
+        tried_keys: Set[str] = set()
 
-        for attempt in range(1, MAX_RETRIES + 2):
+        while True:
+            attempt += 1
             now = time.monotonic()
             remaining_budget = GLOBAL_REQUEST_TIMEOUT - (now - start_time)
             if remaining_budget < 1.0:
@@ -846,11 +881,20 @@ class SmartProxyAddon:
                 logger.info(f"[SmartProxy] Client disconnected on {domain}, aborting attempt loop.")
                 break
 
-            node = pool.select_best_for(domain, check_rate_limit=True)
-            if not node or (node == last_failed and pool.count() > 1):
+            if attempt == 1:
                 node = pool.get_current_or_best(domain)
-                if not node:
-                    break
+                if not node or node.key in tried_keys:
+                    node = pool.select_candidate_for(domain, exclude_keys=tried_keys)
+            else:
+                node = pool.select_candidate_for(domain, exclude_keys=tried_keys)
+
+            if not node:
+                logger.warning(
+                    f"[SmartProxy] All available proxy nodes exhausted for {domain} on attempt {attempt}."
+                )
+                break
+
+            tried_keys.add(node.key)
 
             if attempt == 1:
                 attempt_timeout = min(INITIAL_REQUEST_TIMEOUT, remaining_budget)
@@ -883,7 +927,9 @@ class SmartProxyAddon:
 
                 allow_replay = (method in SAFE_METHODS) or (flow.request.headers.get("X-Allow-Mutation-Replay") == "1")
 
-                if not resp_blocked or not allow_replay or attempt == (MAX_RETRIES + 1):
+                remaining_after = GLOBAL_REQUEST_TIMEOUT - (time.monotonic() - start_time)
+                has_untried = pool.has_untried_healthy(domain, tried_keys)
+                if not resp_blocked or not allow_replay or remaining_after < 1.0 or not has_untried:
                     flow.response = resp
                     flow.metadata["upstream_proxy"] = node
                     if not resp_blocked:
