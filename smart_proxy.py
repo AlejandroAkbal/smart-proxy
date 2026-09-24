@@ -29,7 +29,7 @@ CHALLENGE_RE = re.compile(
     re.I,
 )
 RETRY_STATUSES = {403, 429, 502, 503, 504}
-SAFE_METHODS = {"GET", "HEAD", "OPTIONS", "PUT", "DELETE"}
+SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
 
 COOLDOWN_SECONDS = int(os.environ.get("COOLDOWN_SECONDS", "60"))
 MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "3"))
@@ -701,6 +701,10 @@ class SmartProxyAddon:
 
         # Async non-blocking replay loop
         for retry_num in range(1, MAX_RETRIES + 1):
+            if not flow.client_conn.connected:
+                logger.info(f"[SmartProxy] Client disconnected on {domain}, aborting replay loop.")
+                break
+
             next_node = pool.select_best_for(domain, check_rate_limit=True)
             if not next_node or (next_node == last_failed and pool.count() > 1):
                 break
@@ -756,6 +760,10 @@ class SmartProxyAddon:
 
         # Async non-blocking error recovery loop
         for retry_num in range(1, MAX_RETRIES + 1):
+            if not flow.client_conn.connected:
+                logger.info(f"[SmartProxy] Client disconnected on {domain}, aborting error recovery.")
+                break
+
             next_node = pool.select_best_for(domain, check_rate_limit=True)
             if not next_node or (next_node == last_failed and pool.count() > 1):
                 break
