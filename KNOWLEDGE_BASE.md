@@ -173,3 +173,63 @@ Request ────► [ Layer 1: Cloudflare WAF ] ────► [ Layer 2: e
   1. `_decompress_body(raw_bytes, encoding)` is explicitly invoked inside `_fetch_upstream_sync` to decompress `gzip`, `deflate`, `br`, and `zstd` payloads into plain plaintext/bytes.
   2. Hop-by-hop and encoding headers (`Content-Encoding`, `Transfer-Encoding`, `Content-Length`) are stripped before calling `Response.make()`, allowing mitmproxy to set clean chunked/length framing downstream.
 
+---
+
+## 8. Unified Fleet + Public Pool Architecture
+
+### 8.1 Single-Pool Selection Over Branching
+- **Core Principle**: No hardcoded routing rules or fallback tiers for specific websites.
+- **Node Aggregation**: All available egress nodes are ingested into a single in-memory pool:
+  - **Fleet Sing-boxes** (via `UPSTREAM_PROXIES` environment variable): Tailscale SOCKS5/HTTP inbounds on port `1080` across Hetzner, Oracle, VSYS, and Raspberry Pi.
+  - **Dynamic Public Proxies** (via `ADAPTER_URL=http://worldpool-adapter:3000`): Scraped and health-checked endpoints (`worldpool.yaml`, `monosans.yaml`, etc.).
+- **Latency & Reliability Ranking**:
+  ```python
+  healthy.sort(key=lambda n: (n.ema_latency_ms, n.failure_count))
+  ```
+  Every candidate node is evaluated on real measured latency (EMA) and domain-specific failure counters.
+- **Natural Routing Dynamics**:
+  - For unblocked boorus (`rule34.paheal.net`): Fleet nodes on `hetzner-de-1` (~52ms) and `hetzner-de-2` (~81ms) automatically win on pure speed, providing sub-100ms response times.
+  - For ASN-blocked boorus (`e621.net` on Hetzner): Hetzner exit nodes receive a domain-scoped quarantine cooldown upon receiving a Cloudflare 403, seamlessly rotating traffic to `vsys-nl-1` (96ms), `oracle-es-1/2` (211ms), or `metal-raspberry-pi` (residential).
+
+### 8.2 Replay Resilience & Concurrency Guardrails
+1. **Safe Methods Enforcement**: Auto-replay is strictly restricted to idempotent read verbs:
+   ```python
+   SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
+   ```
+   Mutating requests (`POST`, `PUT`, `DELETE`) are never replayed automatically to prevent duplicate state changes on upstream servers.
+2. **Client Disconnect Short-Circuit**:
+   ```python
+   if not flow.client_conn.connected:
+       break
+   ```
+   If downstream clients (Node.js API, browser, or UptimeRobot) close their socket prematurely, replay loops abort immediately, preventing worker thread starvation and zombie TCP sockets.
+
+---
+
+## 9. Architectural Audit: Why Not Battle-Tested Off-The-Shelf Tools?
+
+### 9.1 The L4 vs. L7 Boundary & Protocol Physics
+A frequent architectural question is whether `smart_proxy.py` "reinvents the wheel" compared to tools like Mihomo, Sing-box, Squid, Envoy, or HAProxy:
+- **L4 Tunneling Proxies (Mihomo, Sing-box, HAProxy)**: Operate by establishing raw TCP `CONNECT` tunnels. The proxy only sees encrypted TLS records (`0x17 0x03 0x03`).
+  - **Blind to Bans**: Cloudflare WAF challenge pages, HTTP 403s, and 429s occur *inside* the encrypted TLS payload. To an L4 proxy, a Cloudflare 403 challenge is indistinguishable from a `200 OK`.
+  - **In-Flight Replay Impossibility**: TLS session keys ($K_{client-server}$) are cryptographically bound to the exact TCP connection negotiated by the client. An L4 proxy cannot silently reconnect to another exit node mid-stream without terminating the client's TLS session with decryption errors.
+- **The Invariant**: To inspect HTTP status codes, detect challenge HTML, and replay failed requests transparently before downstream clients see errors, the proxy **must terminate TLS** via a client-trusted private Root CA (`smart-proxy-ca.crt`).
+
+### 9.2 Audit of Candidate Systems
+
+| Candidate | Category | Architectural Trade-Off & Blocker |
+| :--- | :--- | :--- |
+| **Mihomo / Clash Meta** | L4 Proxy | Cannot inspect HTTPS status codes or challenge HTML; cannot replay requests in-flight. |
+| **Bright Data LPM** | L7 Forward Proxy | Requires active commercial account; 2–4 GB Node.js memory footprint; abandoned legacy codebase. |
+| **Scrapoxy** | Cloud Aggregator | Discontinued and abandoned upstream. Designed for cloud VM provisioning (AWS/DO), not multi-proxy forward egress. |
+| **Squid (SSL-Bump)** | Caching Proxy | Static `squid.conf` peers only; no dynamic proxy feed ingestion; treats 403/429 as valid origin responses. |
+| **Envoy / HAProxy** | Reverse/Edge Proxy | No dynamic wildcard forward-proxy certificate generation for arbitrary destinations; no regex body challenge retries. |
+| **Crawlee / Apify** | Scraping Library | In-process client SDK (Node/Python), not an RFC 9110 network daemon that arbitrary services (`Rule-34/API`, ChangeDetection) can point to. |
+
+### 9.3 Why Not Chained Mitmproxy (L7) + Mihomo (L4)?
+Attempting to split the stack (`Client -> Mitmproxy -> Mihomo -> Target`) re-introduces domain-blindness:
+- Cloudflare bans are **per-domain**: An IP can be healthy for generic connectivity tests (`cp.cloudflare.com`) while being hard-blocked on `e621.net`.
+- Mitmproxy cannot signal to Mihomo over the local TCP hop which specific upstream node should be quarantined for a single domain.
+- Mihomo and MetaCubeXD were formally disabled (`profiles: [disabled]`), preserving `worldpool-adapter` as a lightweight feed source and `smart_proxy.py` as the unified L7 router.
+
+
