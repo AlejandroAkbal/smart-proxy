@@ -1,0 +1,62 @@
+# Historical Stack: Mihomo + MetaCubeXD + Worldpool Adapter
+# Preserved from Coolify service qwsm8umlxplwpg8cnndchwrq on hetzner-de-1
+
+services:
+  mihomo:
+    image: 'metacubex/mihomo:latest'
+    restart: unless-stopped
+    ports:
+      - '9888:7890'
+    volumes:
+      - type: bind
+        source: ./mihomo_config
+        target: /root/.config/mihomo/config.yaml
+    environment:
+      - SERVICE_FQDN_MIHOMO_9090
+    depends_on:
+      worldpool-adapter:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - "wget -qO- --header='Authorization: Bearer ***' http://127.0.0.1:9090/version >/dev/null"
+      start_period: 20s
+  metacubexd:
+    image: 'ghcr.io/metacubex/metacubexd:latest'
+    restart: unless-stopped
+    environment:
+      - 'DEFAULT_BACKEND_URL=${SERVICE_URL_MIHOMO}'
+      - SERVICE_FQDN_METACUBEXD_80
+    depends_on:
+      mihomo:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - 'wget -qO- http://127.0.0.1/ >/dev/null'
+      start_period: 20s
+  worldpool-adapter:
+    image: 'python:latest'
+    restart: unless-stopped
+    command:
+      - python3
+      - /app/proxy_adapter.py
+    volumes:
+      - type: bind
+        source: ./proxy_adapter_source
+        target: /app/proxy_adapter.py
+    environment:
+      - 'WORLDPOOL_URL=https://raw.githubusercontent.com/CelestialBrain/worldpool/main/data/proxies.json'
+      - PORT=3000
+      - REFRESH_SECONDS=1200
+      - WEBSHARE_PROXY_URL
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - '-c'
+        - "import urllib.request; assert urllib.request.urlopen('http://127.0.0.1:3000/health', timeout=3).status == 200"
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 180s
