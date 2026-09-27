@@ -80,6 +80,8 @@ from smart_proxy import (
     _extract_sample_body,
     _probe_node,
     _read_with_deadline,
+    _record_blocked_status,
+    parse_retry_after,
 )
 
 
@@ -329,6 +331,218 @@ class TestResilienceAndFraming(unittest.TestCase):
 
         self.assertEqual(len(attempts), 2)
         self.assertEqual(flow.response.status_code, 504)
+
+
+class TestRetryAfterAndRateLimiting(unittest.TestCase):
+    def test_parse_retry_after_delta_seconds(self):
+        """Delta-seconds must parse integer seconds and clamp within [min_seconds, max_seconds]."""
+        self.assertEqual(parse_retry_after("15"), 15.0)
+        self.assertEqual(parse_retry_after("1"), 2.0)  # Clamped to min 2.0s
+        self.assertEqual(parse_retry_after("500"), 300.0)  # Clamped to max 300.0s
+        self.assertEqual(parse_retry_after("   60   "), 60.0)
+        self.assertEqual(parse_retry_after('"120"'), 120.0)
+
+    def test_parse_retry_after_rejections(self):
+        """Must reject nan, inf, negative values, exponents, and malformed strings."""
+        self.assertIsNone(parse_retry_after("nan"))
+        self.assertIsNone(parse_retry_after("NaN"))
+        self.assertIsNone(parse_retry_after("inf"))
+        self.assertIsNone(parse_retry_after("-inf"))
+        self.assertIsNone(parse_retry_after("-10"))
+        self.assertIsNone(parse_retry_after("1e2"))
+        self.assertIsNone(parse_retry_after(""))
+        self.assertIsNone(parse_retry_after(None))
+        self.assertIsNone(parse_retry_after("not-a-number"))
+
+    def test_parse_retry_after_http_dates(self):
+        """HTTP-dates (RFC 1123, ANSI C asctime, leap seconds) must parse correctly with UTC awareness."""
+        import datetime
+        now = datetime.datetime(2026, 10, 21, 7, 27, 50, tzinfo=datetime.timezone.utc)
+        
+        # IMF-fixdate (10 seconds in future)
+        val1 = parse_retry_after("Wed, 21 Oct 2026 07:28:00 GMT", now=now)
+        self.assertIsNotNone(val1)
+        self.assertAlmostEqual(val1 or 0.0, 10.0, places=1)
+
+        # ANSI C asctime format (naive date without tz in string)
+        val2 = parse_retry_after("Wed Oct 21 07:28:00 2026", now=now)
+        self.assertIsNotNone(val2)
+        self.assertAlmostEqual(val2 or 0.0, 10.0, places=1)
+
+        # Leap second :60 normalized to :59 (07:28:59 - 07:27:50 = 69s)
+        val3 = parse_retry_after("Wed, 21 Oct 2026 07:28:60 GMT", now=now)
+        self.assertIsNotNone(val3)
+        self.assertAlmostEqual(val3 or 0.0, 69.0, places=1)
+
+        # Stale/past date (> 60s in the past) returns None
+        past = "Sun, 06 Nov 1994 08:49:37 GMT"
+        self.assertIsNone(parse_retry_after(past, now=now))
+
+    def test_rate_limit_zero_ema_and_failure_count(self):
+        """HTTP 429 rate limit must NOT inflate ema_latency_ms and must NOT increment failure_count."""
+        node = ProxyNode('http', '10.0.0.1', 8080, ema_latency_ms=250.0)
+        now = time.time()
+        node.record_host_rate_limit("donmai.us", retry_after_s=15.0)
+
+        # Invariant checks
+        self.assertEqual(node.ema_latency_ms, 250.0)
+        self.assertEqual(node.failure_count, 0)
+        self.assertGreaterEqual(node.host_cooldowns["donmai.us"], now + 14.9)
+        self.assertFalse(node.is_available_for("donmai.us", now))
+
+        # Contrast with standard host failure (403, 502, challenge)
+        node.record_host_failure("donmai.us")
+        self.assertEqual(node.ema_latency_ms, 750.0)
+        self.assertEqual(node.failure_count, 1)
+
+    def test_rate_limit_missing_retry_after_adaptive_backoff(self):
+        """When Retry-After is absent, exponential step-up applies (10s, 20s, 40s...) capped at 300s."""
+        node = ProxyNode('http', '10.0.0.1', 8080)
+        now = time.time()
+
+        # Step 1: 10s
+        node.record_host_rate_limit("donmai.us", retry_after_s=None)
+        self.assertAlmostEqual(node.host_cooldowns["donmai.us"] - now, 10.0, delta=0.5)
+
+        # Step 2: 20s
+        node.record_host_rate_limit("donmai.us", retry_after_s=None)
+        self.assertAlmostEqual(node.host_cooldowns["donmai.us"] - now, 20.0, delta=0.5)
+
+        # Step 3: 40s
+        node.record_host_rate_limit("donmai.us", retry_after_s=None)
+        self.assertAlmostEqual(node.host_cooldowns["donmai.us"] - now, 40.0, delta=0.5)
+
+        # Step 6+: capped at 300s without overflow
+        for _ in range(10):
+            node.record_host_rate_limit("donmai.us", retry_after_s=None)
+        self.assertAlmostEqual(node.host_cooldowns["donmai.us"] - now, 300.0, delta=0.5)
+
+    def test_rate_limit_success_resets_consecutive_counter(self):
+        """A successful response for the domain clears consecutive rate limits."""
+        node = ProxyNode('http', '10.0.0.1', 8080)
+        node.record_host_rate_limit("donmai.us")
+        self.assertEqual(node.consecutive_rate_limits.get("donmai.us"), 1)
+
+        node.record_success(50.0, domain="donmai.us")
+        self.assertNotIn("donmai.us", node.consecutive_rate_limits)
+
+    def test_rate_limit_counter_not_cleared_on_origin_error_or_host_failure(self):
+        """Origin errors (HTTP >= 400) and host failures must NOT reset consecutive_rate_limits."""
+        node = ProxyNode('http', '10.0.0.1', 8080)
+        node.record_host_rate_limit("donmai.us")
+        self.assertEqual(node.consecutive_rate_limits.get("donmai.us"), 1)
+
+        # Host failure (e.g. 502/timeout/WAF challenge) must not clear rate limit count
+        node.record_host_failure("donmai.us")
+        self.assertEqual(node.consecutive_rate_limits.get("donmai.us"), 1)
+
+        # Clear cooldown so node is available for flow test
+        node.host_cooldowns.clear()
+
+        # Integration: HTTP 500 through flow must not clear rate limit count
+        from smart_proxy import pool as global_pool, SmartProxyAddon
+        global_pool.nodes = [node]
+        global_pool.current_nodes.clear()
+        addon = SmartProxyAddon()
+
+        flow = MagicMock()
+        flow.request.method = 'GET'
+        flow.request.pretty_host = 'danbooru.donmai.us'
+        flow.request.url = 'https://danbooru.donmai.us/posts.json'
+        flow.request.headers = {}
+        flow.metadata = {}
+        flow.response = None
+        flow.client_conn = MagicMock(connected=True, id='c_err')
+
+        orig_fetch = smart_proxy._fetch_upstream_sync
+        smart_proxy._fetch_upstream_sync = lambda f, n, to: MagicMock(status_code=500, content=b'Server Error', headers={})
+        try:
+            asyncio.run(addon.request(flow))
+        finally:
+            smart_proxy._fetch_upstream_sync = orig_fetch
+
+        self.assertEqual(node.consecutive_rate_limits.get("donmai.us"), 1)
+
+        # HTTP 200 through flow MUST clear rate limit count
+        flow2 = MagicMock()
+        flow2.request.method = 'GET'
+        flow2.request.pretty_host = 'danbooru.donmai.us'
+        flow2.request.url = 'https://danbooru.donmai.us/posts.json'
+        flow2.request.headers = {}
+        flow2.metadata = {}
+        flow2.response = None
+        flow2.client_conn = MagicMock(connected=True, id='c_ok')
+
+        smart_proxy._fetch_upstream_sync = lambda f, n, to: MagicMock(status_code=200, content=b'[]', headers={})
+        try:
+            asyncio.run(addon.request(flow2))
+        finally:
+            smart_proxy._fetch_upstream_sync = orig_fetch
+
+        self.assertNotIn("donmai.us", node.consecutive_rate_limits)
+
+    def test_select_best_for_returns_none_when_all_on_cooldown(self):
+        """select_best_for must return None if all nodes are in cooldown, preserving rate limit window."""
+        pool = StickyLatencyPool()
+        n = ProxyNode('http', '10.0.0.1', 8080)
+        pool.update_nodes([n])
+        pool.mark_host_rate_limit(n, "donmai.us", retry_after_s=60.0)
+
+        best = pool.select_best_for("donmai.us")
+        self.assertIsNone(best)
+
+    def test_waf_challenge_precedence_over_429(self):
+        """A Cloudflare challenge with status 429 must be classified as WAF failure (500ms EMA penalty)."""
+        node = ProxyNode('http', '10.0.0.1', 8080, ema_latency_ms=250.0)
+        resp = MagicMock(status_code=429, headers={"retry-after": "5"})
+        resp_sample = b"<html><title>Just a moment...</title><div class='cf-chl-widget'></div></html>"
+
+        _record_blocked_status(node, "donmai.us", resp, resp_sample)
+        # Must be treated as WAF challenge failure, not rate limit
+        self.assertEqual(node.ema_latency_ms, 750.0)
+        self.assertEqual(node.failure_count, 1)
+
+    def test_integration_request_429_retry_after_failover(self):
+        """Integration: Request hitting 429 with Retry-After: 5 fails over to node 2, leaving node 1 EMA intact."""
+        from smart_proxy import pool as global_pool, SmartProxyAddon
+
+        n1 = ProxyNode('http', '10.0.0.1', 8080, ema_latency_ms=100.0)
+        n2 = ProxyNode('http', '10.0.0.2', 8080, ema_latency_ms=200.0)
+        global_pool.nodes = []
+        global_pool.current_nodes.clear()
+        global_pool.update_nodes([n1, n2])
+        addon = SmartProxyAddon()
+
+        flow = MagicMock()
+        flow.request.method = 'GET'
+        flow.request.pretty_host = 'danbooru.donmai.us'
+        flow.request.url = 'https://danbooru.donmai.us/posts.json'
+        flow.request.headers = {}
+        flow.metadata = {}
+        flow.response = None
+        flow.client_conn = MagicMock(connected=True, id='c_rl')
+
+        attempts = []
+        orig_fetch = smart_proxy._fetch_upstream_sync
+
+        def mock_fetch(f, node, timeout):
+            attempts.append(node.key)
+            if node.key == n1.key:
+                return MagicMock(status_code=429, content=b'Too Many Requests', headers={'retry-after': '5'})
+            return MagicMock(status_code=200, content=b'[]', headers={'content-type': 'application/json'})
+
+        smart_proxy._fetch_upstream_sync = mock_fetch
+        try:
+            asyncio.run(addon.request(flow))
+        finally:
+            smart_proxy._fetch_upstream_sync = orig_fetch
+
+        self.assertEqual(attempts, [n1.key, n2.key])
+        self.assertEqual(flow.response.status_code, 200)
+        # n1 should have kept its 100ms EMA without penalty
+        self.assertEqual(n1.ema_latency_ms, 100.0)
+        self.assertEqual(n1.failure_count, 0)
+        self.assertFalse(n1.is_available_for("donmai.us", time.time()))
 
 
 if __name__ == "__main__":
