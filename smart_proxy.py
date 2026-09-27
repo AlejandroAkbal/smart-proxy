@@ -1,6 +1,8 @@
 import asyncio
 import base64
 import concurrent.futures
+import datetime
+import email.utils
 import gzip
 import io
 import logging
@@ -13,7 +15,7 @@ import urllib.parse
 import urllib.request
 import zlib
 from dataclasses import dataclass, field
-from typing import Any, List, Optional, Set
+from typing import Any, List, Optional, Set, Union
 
 # Reasonable default timeout on socket operations for slow booru backends
 socket.setdefaulttimeout(15.0)
@@ -51,6 +53,60 @@ UPSTREAM_PROXIES_ENV = os.environ.get("UPSTREAM_PROXIES", "")
 RATE_LIMIT_RPS = float(os.environ.get("RATE_LIMIT_RPS", "0"))
 
 
+def parse_retry_after(
+    raw_header: Optional[str],
+    now: Optional[Union[float, datetime.datetime]] = None,
+    min_seconds: float = 2.0,
+    max_seconds: float = 300.0,
+) -> Optional[float]:
+    """Parses RFC 9110 Retry-After header (delta-seconds or HTTP-date).
+    Returns clamped seconds in [min_seconds, max_seconds], or None if unparseable/invalid.
+    """
+    if not raw_header:
+        return None
+    raw_clean = str(raw_header).strip().strip("\"'")
+    if not raw_clean:
+        return None
+
+    # Delta-seconds: strictly digits (RFC 9110 §10.2.3 requires 1*DIGIT)
+    if raw_clean.isdigit():
+        try:
+            val = float(raw_clean)
+            return min(max(val, min_seconds), max_seconds)
+        except (ValueError, OverflowError):
+            return None
+
+    # HTTP-date (RFC 9110 §5.6.7: IMF-fixdate, RFC 850, or ANSI C asctime)
+    # Normalize leap seconds (:60) to :59
+    date_str = re.sub(r":60(?=[^\d]|$)", ":59", raw_clean)
+    try:
+        dt = email.utils.parsedate_to_datetime(date_str)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        else:
+            dt = dt.astimezone(datetime.timezone.utc)
+
+        if now is None:
+            now_utc = datetime.datetime.now(datetime.timezone.utc)
+        elif isinstance(now, (int, float)):
+            now_utc = datetime.datetime.fromtimestamp(now, tz=datetime.timezone.utc)
+        elif isinstance(now, datetime.datetime):
+            if now.tzinfo is None:
+                now_utc = now.replace(tzinfo=datetime.timezone.utc)
+            else:
+                now_utc = now.astimezone(datetime.timezone.utc)
+        else:
+            now_utc = datetime.datetime.now(datetime.timezone.utc)
+
+        delta = (dt - now_utc).total_seconds()
+        if delta < -60.0:
+            # Stale/past header
+            return None
+        return min(max(delta, min_seconds), max_seconds)
+    except (ValueError, TypeError, IndexError, OverflowError):
+        return None
+
+
 @dataclass
 class ProxyNode:
     scheme: str  # "http" | "socks5"
@@ -59,6 +115,7 @@ class ProxyNode:
     auth: Optional[str] = None
     global_cooldown_until: float = 0.0
     host_cooldowns: dict[str, float] = field(default_factory=dict)
+    consecutive_rate_limits: dict[str, int] = field(default_factory=dict)
     ema_latency_ms: float = 500.0
     success_count: int = 0
     failure_count: int = 0
@@ -99,9 +156,38 @@ class ProxyNode:
             return True
         return False
 
-    def record_success(self, duration_ms: float):
+    def record_success(self, duration_ms: float, domain: Optional[str] = None):
         self.success_count += 1
         self.ema_latency_ms = (0.25 * duration_ms) + (0.75 * self.ema_latency_ms)
+        if domain:
+            self.consecutive_rate_limits.pop(domain, None)
+
+    def record_host_rate_limit(self, domain: str, retry_after_s: Optional[float] = None):
+        now = time.time()
+        count = self.consecutive_rate_limits.get(domain, 0) + 1
+        self.consecutive_rate_limits[domain] = count
+
+        if len(self.consecutive_rate_limits) >= 500:
+            sorted_domains = list(self.consecutive_rate_limits.keys())
+            for d in sorted_domains[:100]:
+                self.consecutive_rate_limits.pop(d, None)
+
+        if retry_after_s is not None:
+            cooldown = retry_after_s
+        else:
+            exp = min(count - 1, 5)
+            cooldown = min(10.0 * (2 ** exp), 300.0)
+
+        if len(self.host_cooldowns) >= 500:
+            active = {k: v for k, v in self.host_cooldowns.items() if v > now}
+            if len(active) >= 500:
+                sorted_keys = sorted(active.keys(), key=lambda k: active[k])
+                for k in sorted_keys[:100]:
+                    active.pop(k, None)
+            self.host_cooldowns = active
+
+        self.host_cooldowns[domain] = now + cooldown
+        # Rate limits do not penalize ema_latency_ms and do not increment failure_count
 
     def record_host_failure(self, domain: str):
         now = time.time()
@@ -204,8 +290,7 @@ class StickyLatencyPool:
                 self.current_nodes[domain] = best
                 return best
 
-            # Fallback: if all on cooldown for this domain, pick earliest expiring
-            return min(self.nodes, key=lambda n: n.get_effective_cooldown(domain))
+            return None
 
     def get_current_or_best(self, domain: str) -> Optional[ProxyNode]:
         """Keeps active sticky node for domain if healthy and has token.
@@ -277,6 +362,12 @@ class StickyLatencyPool:
             if self.current_nodes.get(domain) and self.current_nodes[domain].key == node.key:
                 self.current_nodes.pop(domain, None)
 
+    def mark_host_rate_limit(self, node: ProxyNode, domain: str, retry_after_s: Optional[float] = None):
+        with self.lock:
+            node.record_host_rate_limit(domain, retry_after_s)
+            if self.current_nodes.get(domain) and self.current_nodes[domain].key == node.key:
+                self.current_nodes.pop(domain, None)
+
     def mark_global_failed(self, node: ProxyNode):
         with self.lock:
             node.record_global_failure()
@@ -284,9 +375,9 @@ class StickyLatencyPool:
                 if cur.key == node.key:
                     self.current_nodes.pop(domain, None)
 
-    def record_latency(self, node: ProxyNode, duration_ms: float):
+    def record_latency(self, node: ProxyNode, duration_ms: float, domain: Optional[str] = None):
         with self.lock:
-            node.record_success(duration_ms)
+            node.record_success(duration_ms, domain)
 
     def count(self) -> int:
         with self.lock:
@@ -752,6 +843,17 @@ def _fetch_upstream_sync(flow: mitm_http.HTTPFlow, node: ProxyNode, timeout: flo
                 pass
 
 
+def _record_blocked_status(node: ProxyNode, domain: str, resp: mitm_http.Response, resp_sample: bytes):
+    is_challenge = bool(CHALLENGE_RE.search(resp_sample))
+    headers = resp.headers if resp.headers else {}
+    retry_after_raw = headers.get("retry-after") or headers.get("Retry-After")
+    if not is_challenge and (resp.status_code == 429 or (resp.status_code == 503 and retry_after_raw)):
+        retry_after_s = parse_retry_after(retry_after_raw)
+        pool.mark_host_rate_limit(node, domain, retry_after_s)
+    else:
+        pool.mark_host_failed(node, domain)
+
+
 class SmartProxyAddon:
     def __init__(self):
         global _active_addon
@@ -934,15 +1036,19 @@ class SmartProxyAddon:
                     flow.metadata["upstream_proxy"] = node
                     if not resp_blocked:
                         pool.set_current_node(domain, node)
-                        pool.record_latency(node, (time.monotonic() - start_time) * 1000.0)
+                        pool.record_latency(
+                            node,
+                            (time.monotonic() - start_time) * 1000.0,
+                            domain=domain if resp_status < 400 else None,
+                        )
                     else:
-                        pool.mark_host_failed(node, domain)
+                        _record_blocked_status(node, domain, resp, resp_sample)
                     return
                 else:
                     logger.warning(
                         f"[SmartProxy] Attempt {attempt} on {node.key} returned status {resp_status}/challenge. Quarantining for {domain}..."
                     )
-                    pool.mark_host_failed(node, domain)
+                    _record_blocked_status(node, domain, resp, resp_sample)
             else:
                 logger.warning(
                     f"[SmartProxy] Attempt {attempt} on {node.key} timed out or connection failed. Quarantining globally..."
