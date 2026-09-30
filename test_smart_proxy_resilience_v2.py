@@ -392,10 +392,12 @@ class TestRetryAfterAndRateLimiting(unittest.TestCase):
         self.assertGreaterEqual(node.host_cooldowns["donmai.us"], now + 14.9)
         self.assertFalse(node.is_available_for("donmai.us", now))
 
-        # Contrast with standard host failure (403, 502, challenge)
+        # Host-specific failures preserve global quality while quarantining this domain.
         node.record_host_failure("donmai.us")
-        self.assertEqual(node.ema_latency_ms, 750.0)
-        self.assertEqual(node.failure_count, 1)
+        self.assertEqual(node.ema_latency_ms, 250.0)
+        self.assertEqual(node.failure_count, 0)
+        self.assertFalse(node.is_available_for("donmai.us", time.time()))
+        self.assertTrue(node.is_available_for("example.com", time.time()))
 
     def test_rate_limit_missing_retry_after_adaptive_backoff(self):
         """When Retry-After is absent, exponential step-up applies (10s, 20s, 40s...) capped at 300s."""
@@ -494,15 +496,17 @@ class TestRetryAfterAndRateLimiting(unittest.TestCase):
         self.assertIsNone(best)
 
     def test_waf_challenge_precedence_over_429(self):
-        """A Cloudflare challenge with status 429 must be classified as WAF failure (500ms EMA penalty)."""
+        """A Cloudflare challenge with status 429 uses host failure quarantine, not rate-limit state."""
         node = ProxyNode('http', '10.0.0.1', 8080, ema_latency_ms=250.0)
         resp = MagicMock(status_code=429, headers={"retry-after": "5"})
         resp_sample = b"<html><title>Just a moment...</title><div class='cf-chl-widget'></div></html>"
 
         _record_blocked_status(node, "donmai.us", resp, resp_sample)
-        # Must be treated as WAF challenge failure, not rate limit
-        self.assertEqual(node.ema_latency_ms, 750.0)
-        self.assertEqual(node.failure_count, 1)
+        # Must be treated as a domain quarantine without changing global quality.
+        self.assertEqual(node.ema_latency_ms, 250.0)
+        self.assertEqual(node.failure_count, 0)
+        self.assertFalse(node.is_available_for("donmai.us", time.time()))
+        self.assertNotIn("donmai.us", node.consecutive_rate_limits)
 
     def test_integration_request_429_retry_after_failover(self):
         """Integration: Request hitting 429 with Retry-After: 5 fails over to node 2, leaving node 1 EMA intact."""
