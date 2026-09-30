@@ -3,6 +3,7 @@ import base64
 import concurrent.futures
 import datetime
 import email.utils
+import enum
 import gzip
 import io
 import logging
@@ -122,6 +123,8 @@ class ProxyNode:
     ema_latency_ms: float = 500.0
     success_count: int = 0
     failure_count: int = 0
+    health_generation: int = 0
+    host_health_generations: dict[str, int] = field(default_factory=dict)
 
     # Rate limiting: token bucket
     tokens: float = 5.0
@@ -160,12 +163,21 @@ class ProxyNode:
         return False
 
     def record_success(self, duration_ms: float, domain: Optional[str] = None):
+        self.health_generation += 1
         self.success_count += 1
         self.ema_latency_ms = (0.25 * duration_ms) + (0.75 * self.ema_latency_ms)
         if domain:
+            self.host_health_generations[domain] = self.host_health_generations.get(domain, 0) + 1
             self.consecutive_rate_limits.pop(domain, None)
 
-    def record_host_rate_limit(self, domain: str, retry_after_s: Optional[float] = None):
+    def record_host_rate_limit(
+        self,
+        domain: str,
+        retry_after_s: Optional[float] = None,
+        expected_generation: Optional[int] = None,
+    ) -> bool:
+        if expected_generation is not None and self.host_health_generations.get(domain, 0) != expected_generation:
+            return False
         now = time.time()
         count = self.consecutive_rate_limits.get(domain, 0) + 1
         self.consecutive_rate_limits[domain] = count
@@ -191,8 +203,11 @@ class ProxyNode:
 
         self.host_cooldowns[domain] = now + cooldown
         # Rate limits do not penalize ema_latency_ms and do not increment failure_count
+        return True
 
-    def record_host_failure(self, domain: str):
+    def record_host_failure(self, domain: str, expected_generation: Optional[int] = None) -> bool:
+        if expected_generation is not None and self.host_health_generations.get(domain, 0) != expected_generation:
+            return False
         now = time.time()
         if len(self.host_cooldowns) >= 500:
             active = {k: v for k, v in self.host_cooldowns.items() if v > now}
@@ -203,11 +218,15 @@ class ProxyNode:
                     active.pop(k, None)
             self.host_cooldowns = active
         self.host_cooldowns[domain] = now + COOLDOWN_SECONDS
+        return True
 
-    def record_global_failure(self):
+    def record_global_failure(self, expected_generation: Optional[int] = None) -> bool:
+        if expected_generation is not None and self.health_generation != expected_generation:
+            return False
         self.failure_count += 1
         self.global_cooldown_until = time.time() + COOLDOWN_SECONDS
         self.ema_latency_ms += 1500.0
+        return True
 
 
 def _extract_root_domain(host: str) -> str:
@@ -402,24 +421,38 @@ class StickyLatencyPool:
         with self.lock:
             self.current_nodes[domain] = node
 
-    def mark_host_failed(self, node: ProxyNode, domain: str):
+    def mark_host_failed(
+        self, node: ProxyNode, domain: str, expected_generation: Optional[int] = None
+    ) -> bool:
         with self.lock:
-            node.record_host_failure(domain)
+            if not node.record_host_failure(domain, expected_generation):
+                return False
             if self.current_nodes.get(domain) and self.current_nodes[domain].key == node.key:
                 self.current_nodes.pop(domain, None)
+            return True
 
-    def mark_host_rate_limit(self, node: ProxyNode, domain: str, retry_after_s: Optional[float] = None):
+    def mark_host_rate_limit(
+        self,
+        node: ProxyNode,
+        domain: str,
+        retry_after_s: Optional[float] = None,
+        expected_generation: Optional[int] = None,
+    ) -> bool:
         with self.lock:
-            node.record_host_rate_limit(domain, retry_after_s)
+            if not node.record_host_rate_limit(domain, retry_after_s, expected_generation):
+                return False
             if self.current_nodes.get(domain) and self.current_nodes[domain].key == node.key:
                 self.current_nodes.pop(domain, None)
+            return True
 
-    def mark_global_failed(self, node: ProxyNode):
+    def mark_global_failed(self, node: ProxyNode, expected_generation: Optional[int] = None) -> bool:
         with self.lock:
-            node.record_global_failure()
+            if not node.record_global_failure(expected_generation):
+                return False
             for domain, cur in list(self.current_nodes.items()):
                 if cur.key == node.key:
                     self.current_nodes.pop(domain, None)
+            return True
 
     def record_latency(self, node: ProxyNode, duration_ms: float, domain: Optional[str] = None):
         with self.lock:
@@ -774,6 +807,19 @@ _WORKER_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=32, thread_
 _active_addon: Optional["SmartProxyAddon"] = None
 
 
+class UpstreamFailureKind(enum.Enum):
+    PROXY_CONNECT = "proxy_connect"
+    DESTINATION = "destination"
+    CALLER_CANCELLED = "caller_cancelled"
+
+
+class UpstreamFetchError(Exception):
+    def __init__(self, kind: UpstreamFailureKind, cause: BaseException):
+        super().__init__(f"{kind.value}: {type(cause).__name__}: {cause}")
+        self.kind = kind
+        self.cause = cause
+
+
 def _fetch_upstream_sync(flow: mitm_http.HTTPFlow, node: ProxyNode, timeout: float = REPLAY_TIMEOUT) -> Optional[mitm_http.Response]:
     """Synchronous worker function run in background executor thread with strict absolute deadline."""
     global _active_addon
@@ -806,6 +852,7 @@ def _fetch_upstream_sync(flow: mitm_http.HTTPFlow, node: ProxyNode, timeout: flo
     body = flow.request.content if flow.request.content else None
 
     conn = None
+    proxy_connected = False
     registered_socks: list[socket.socket] = []
     client_conn = getattr(flow, "client_conn", None)
     client_id = getattr(client_conn, "id", None) if client_conn else None
@@ -817,7 +864,47 @@ def _fetch_upstream_sync(flow: mitm_http.HTTPFlow, node: ProxyNode, timeout: flo
         # Allow upstream servers/proxies with extensive header sets
         http.client._MAXHEADERS = 1000
 
-        conn = http.client.HTTPConnection(node.host, node.port, timeout=check_deadline())
+        class ClosingTunnelHTTPConnection(http.client.HTTPConnection):
+            def _tunnel(self):
+                connect = b"CONNECT %s:%d HTTP/1.0\r\n" % (
+                    self._tunnel_host.encode("ascii"),
+                    self._tunnel_port,
+                )
+                headers = [connect]
+                for header, value in self._tunnel_headers.items():
+                    headers.append(f"{header}: {value}\r\n".encode("latin-1"))
+                headers.append(b"\r\n")
+                self.send(b"".join(headers))
+
+                response = self.response_class(self.sock, method=self._method)
+                try:
+                    _, code, message = response._read_status()
+                    if code != 200:
+                        self.close()
+                        raise OSError(f"Tunnel connection failed: {code} {message.strip()}")
+                    while True:
+                        line = response.fp.readline(http.client._MAXLINE + 1)
+                        if len(line) > http.client._MAXLINE:
+                            raise http.client.LineTooLong("header line")
+                        if line in (b"\r\n", b"\n", b""):
+                            break
+                finally:
+                    response.close()
+
+        conn = ClosingTunnelHTTPConnection(node.host, node.port, timeout=check_deadline())
+        create_connection = conn._create_connection
+
+        def tracked_create_connection(*args, **kwargs):
+            nonlocal proxy_connected
+            sock = create_connection(*args, **kwargs)
+            proxy_connected = True
+            if client_id and _active_addon:
+                if not _active_addon.register_active_socket(client_id, sock):
+                    raise ConnectionAbortedError("Caller disconnected")
+                registered_socks.append(sock)
+            return sock
+
+        conn._create_connection = tracked_create_connection
 
         if is_https:
             tunnel_headers = {}
@@ -825,22 +912,17 @@ def _fetch_upstream_sync(flow: mitm_http.HTTPFlow, node: ProxyNode, timeout: flo
                 tunnel_headers["Proxy-Authorization"] = f"Basic {encoded_auth}"
             conn.set_tunnel(f"{target_host}:{target_port}", headers=tunnel_headers)
             conn.connect()
-            if client_id and _active_addon and conn.sock:
-                _active_addon.register_active_socket(client_id, conn.sock)
-                registered_socks.append(conn.sock)
             context = ssl.create_default_context()
             context.check_hostname = False
             context.verify_mode = ssl.CERT_NONE
             conn.sock.settimeout(check_deadline())
             conn.sock = context.wrap_socket(conn.sock, server_hostname=target_host)
             if client_id and _active_addon and conn.sock:
-                _active_addon.register_active_socket(client_id, conn.sock)
+                if not _active_addon.register_active_socket(client_id, conn.sock):
+                    raise ConnectionAbortedError("Caller disconnected")
                 registered_socks.append(conn.sock)
         else:
             conn.connect()
-            if client_id and _active_addon and conn.sock:
-                _active_addon.register_active_socket(client_id, conn.sock)
-                registered_socks.append(conn.sock)
 
         req_path = flow.request.url if not is_https else (parsed.path or "/")
         if parsed.query and is_https:
@@ -895,8 +977,19 @@ def _fetch_upstream_sync(flow: mitm_http.HTTPFlow, node: ProxyNode, timeout: flo
             res.headers["content-length"] = orig_clen
         return res
     except Exception as e:
-        logger.warning(f"[SmartProxy] Replay upstream connection failed to {node.key}: {type(e).__name__}: {e}")
-        return None
+        cancelled = bool(client_id and _active_addon and _active_addon.is_client_cancelled(client_id))
+        tunnel_auth_failure = proxy_connected and str(e).startswith("Tunnel connection failed: 407 ")
+        kind = (
+            UpstreamFailureKind.CALLER_CANCELLED
+            if cancelled
+            else UpstreamFailureKind.PROXY_CONNECT
+            if not proxy_connected or tunnel_auth_failure
+            else UpstreamFailureKind.DESTINATION
+        )
+        logger.warning(
+            f"[SmartProxy] Replay upstream {kind.value} failure via {node.key}: {type(e).__name__}: {e}"
+        )
+        raise UpstreamFetchError(kind, e) from e
     finally:
         for s in registered_socks:
             if client_id and _active_addon:
@@ -908,15 +1001,21 @@ def _fetch_upstream_sync(flow: mitm_http.HTTPFlow, node: ProxyNode, timeout: flo
                 pass
 
 
-def _record_blocked_status(node: ProxyNode, domain: str, resp: mitm_http.Response, resp_sample: bytes):
+def _record_blocked_status(
+    node: ProxyNode,
+    domain: str,
+    resp: mitm_http.Response,
+    resp_sample: bytes,
+    expected_generation: Optional[int] = None,
+):
     is_challenge = bool(CHALLENGE_RE.search(resp_sample))
     headers = resp.headers if resp.headers else {}
     retry_after_raw = headers.get("retry-after") or headers.get("Retry-After")
     if not is_challenge and (resp.status_code == 429 or (resp.status_code == 503 and retry_after_raw)):
         retry_after_s = parse_retry_after(retry_after_raw)
-        pool.mark_host_rate_limit(node, domain, retry_after_s)
+        pool.mark_host_rate_limit(node, domain, retry_after_s, expected_generation)
     else:
-        pool.mark_host_failed(node, domain)
+        pool.mark_host_failed(node, domain, expected_generation)
 
 
 class RejectSocksRawTCPLayer(layer.Layer):
@@ -961,13 +1060,26 @@ class SmartProxyAddon:
         _active_addon = self
         self.authenticated_conns: Set[str] = set()
         self.active_sockets_by_client: dict[str, set[socket.socket]] = {}
+        self.cancelled_client_ids: dict[str, float] = {}
         self.socket_lock = threading.Lock()
 
-    def register_active_socket(self, client_id: str, sock: socket.socket) -> None:
+    def register_active_socket(self, client_id: str, sock: socket.socket) -> bool:
         with self.socket_lock:
+            cancelled_until = self.cancelled_client_ids.get(client_id, 0.0)
+            if cancelled_until > time.monotonic():
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+                return False
             if client_id not in self.active_sockets_by_client:
                 self.active_sockets_by_client[client_id] = set()
             self.active_sockets_by_client[client_id].add(sock)
+            return True
+
+    def is_client_cancelled(self, client_id: str) -> bool:
+        with self.socket_lock:
+            return self.cancelled_client_ids.get(client_id, 0.0) > time.monotonic()
 
     def unregister_active_socket(self, client_id: str, sock: socket.socket) -> None:
         with self.socket_lock:
@@ -997,6 +1109,13 @@ class SmartProxyAddon:
     def client_disconnected(self, client: Client) -> None:
         self.authenticated_conns.discard(client.id)
         with self.socket_lock:
+            now = time.monotonic()
+            self.cancelled_client_ids = {
+                key: deadline
+                for key, deadline in self.cancelled_client_ids.items()
+                if deadline > now
+            }
+            self.cancelled_client_ids[client.id] = now + GLOBAL_REQUEST_TIMEOUT + REPLAY_TIMEOUT + 1.0
             socks = self.active_sockets_by_client.pop(client.id, set())
         for s in socks:
             try:
@@ -1135,6 +1254,8 @@ class SmartProxyAddon:
                 break
 
             tried_keys.add(node.key)
+            attempt_generation = node.health_generation
+            attempt_host_generation = node.host_health_generations.get(domain, 0)
 
             if attempt == 1:
                 attempt_timeout = min(INITIAL_REQUEST_TIMEOUT, remaining_budget)
@@ -1148,6 +1269,7 @@ class SmartProxyAddon:
 
             loop = asyncio.get_running_loop()
             attempt_started = time.monotonic()
+            failure_kind = UpstreamFailureKind.PROXY_CONNECT
             try:
                 resp = await asyncio.wait_for(
                     loop.run_in_executor(_WORKER_EXECUTOR, _fetch_upstream_sync, flow, node, attempt_timeout),
@@ -1155,9 +1277,18 @@ class SmartProxyAddon:
                 )
             except asyncio.TimeoutError:
                 logger.warning(f"[SmartProxy] Attempt {attempt} on {node.key} hit asyncio timeout ({attempt_timeout:.1f}s)")
+                failure_kind = (
+                    UpstreamFailureKind.CALLER_CANCELLED
+                    if client_id and self.is_client_cancelled(client_id)
+                    else UpstreamFailureKind.DESTINATION
+                )
+                resp = None
+            except UpstreamFetchError as e:
+                failure_kind = e.kind
                 resp = None
             except Exception as e:
                 logger.warning(f"[SmartProxy] Attempt {attempt} on {node.key} failed: {e}")
+                failure_kind = UpstreamFailureKind.PROXY_CONNECT
                 resp = None
 
             if resp is not None:
@@ -1181,18 +1312,29 @@ class SmartProxyAddon:
                             domain=domain if resp_status < 400 else None,
                         )
                     else:
-                        _record_blocked_status(node, domain, resp, resp_sample)
+                        _record_blocked_status(node, domain, resp, resp_sample, attempt_host_generation)
                     return
                 else:
                     logger.warning(
                         f"[SmartProxy] Attempt {attempt} on {node.key} returned status {resp_status}/challenge. Quarantining for {domain}..."
                     )
-                    _record_blocked_status(node, domain, resp, resp_sample)
+                    _record_blocked_status(node, domain, resp, resp_sample, attempt_host_generation)
             else:
-                logger.warning(
-                    f"[SmartProxy] Attempt {attempt} on {node.key} timed out or connection failed. Quarantining globally..."
-                )
-                pool.mark_global_failed(node)
+                if failure_kind == UpstreamFailureKind.CALLER_CANCELLED:
+                    logger.info(f"[SmartProxy] Attempt {attempt} on {node.key} cancelled by caller.")
+                    break
+                if failure_kind == UpstreamFailureKind.DESTINATION:
+                    logger.warning(
+                        f"[SmartProxy] Attempt {attempt} on {node.key} failed after proxy connection. Quarantining for {domain}..."
+                    )
+                    if not pool.mark_host_failed(node, domain, expected_generation=attempt_host_generation):
+                        logger.info(f"[SmartProxy] Ignored stale destination failure on {node.key} after a newer success.")
+                else:
+                    logger.warning(
+                        f"[SmartProxy] Attempt {attempt} could not connect to {node.key}. Quarantining globally..."
+                    )
+                    if not pool.mark_global_failed(node, expected_generation=attempt_generation):
+                        logger.info(f"[SmartProxy] Ignored stale failure on {node.key} after a newer success.")
                 allow_replay = (method in SAFE_METHODS) or (flow.request.headers.get("X-Allow-Mutation-Replay") == "1")
                 if not allow_replay:
                     logger.warning(

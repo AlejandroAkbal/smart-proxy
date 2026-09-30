@@ -273,10 +273,22 @@ def test_protocol_edge_cases():
             flow = mitm_http.HTTPFlow(
                 request=mitm_http.Request("GET", "https://example.com/tunnel-test")
             )
-            resp = smart_proxy._fetch_upstream_sync(flow, node, timeout=1.0)
-            # On CONNECT failure, _fetch_upstream_sync catches error and returns None safely
-            passed = resp is None
-            record_result(f"1.3 CONNECT Tunnel Error {code} {phrase}", passed, f"Returned None: {resp is None}")
+            expected_kind = (
+                smart_proxy.UpstreamFailureKind.PROXY_CONNECT
+                if code == 407
+                else smart_proxy.UpstreamFailureKind.DESTINATION
+            )
+            try:
+                smart_proxy._fetch_upstream_sync(flow, node, timeout=1.0)
+                actual_kind = None
+            except smart_proxy.UpstreamFetchError as exc:
+                actual_kind = exc.kind
+            passed = actual_kind == expected_kind
+            record_result(
+                f"1.3 CONNECT Tunnel Error {code} {phrase}",
+                passed,
+                f"Failure kind: {actual_kind}, expected: {expected_kind}",
+            )
         finally:
             server.stop()
 
@@ -507,11 +519,19 @@ def test_deadlock_and_slowloris_timeouts():
         
         t0 = time.time()
         # Set REPLAY_TIMEOUT to 1.0s
-        resp = smart_proxy._fetch_upstream_sync(flow, node, timeout=1.0)
+        try:
+            resp = smart_proxy._fetch_upstream_sync(flow, node, timeout=1.0)
+        except smart_proxy.UpstreamFetchError as exc:
+            resp = None
+            failure_kind = exc.kind
         elapsed = time.time() - t0
 
         # Should timeout around 1.0s - 2.0s without hanging for full 8.0s
-        passed = elapsed < 3.0 and resp is None
+        passed = (
+            elapsed < 3.0
+            and resp is None
+            and failure_kind == smart_proxy.UpstreamFailureKind.DESTINATION
+        )
         record_result(
             "3.1 Slowloris Slow-Drip Response Timeout Protection",
             passed,
@@ -537,10 +557,18 @@ def test_deadlock_and_slowloris_timeouts():
             request=mitm_http.Request("GET", f"http://127.0.0.1:{server.port}/blackhole")
         )
         t0 = time.time()
-        resp = smart_proxy._fetch_upstream_sync(flow, node, timeout=0.8)
+        try:
+            resp = smart_proxy._fetch_upstream_sync(flow, node, timeout=0.8)
+        except smart_proxy.UpstreamFetchError as exc:
+            resp = None
+            failure_kind = exc.kind
         elapsed = time.time() - t0
 
-        passed = elapsed < 2.0 and resp is None
+        passed = (
+            elapsed < 2.0
+            and resp is None
+            and failure_kind == smart_proxy.UpstreamFailureKind.DESTINATION
+        )
         record_result(
             "3.2 Blackhole Server Connect/Read Timeout Bound",
             passed,
