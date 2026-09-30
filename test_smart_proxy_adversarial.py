@@ -79,6 +79,8 @@ except ImportError:
     mitmproxy_mod.ctx = type(sys)("ctx")
     mitmproxy_mod.http = mitm_http
     sys.modules["mitmproxy"] = mitmproxy_mod
+    from test_mitmproxy_stubs import install_proxy_stack_stubs
+    install_proxy_stack_stubs(mitmproxy_mod)
     sys.modules["mitmproxy.http"] = mitm_http
     conn_mod = type(sys)("mitmproxy.connection")
     class Server:

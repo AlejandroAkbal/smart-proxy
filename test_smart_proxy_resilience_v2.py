@@ -21,6 +21,8 @@ except ImportError:
     import types
     mitmproxy = types.ModuleType("mitmproxy")
     sys.modules["mitmproxy"] = mitmproxy
+    from test_mitmproxy_stubs import install_proxy_stack_stubs
+    install_proxy_stack_stubs(mitmproxy)
     mitm_http = types.ModuleType("mitmproxy.http")
     sys.modules["mitmproxy.http"] = mitm_http
     mitm_connection = types.ModuleType("mitmproxy.connection")

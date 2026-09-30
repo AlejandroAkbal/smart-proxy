@@ -21,8 +21,11 @@ from typing import Any, List, Optional, Set, Union
 socket.setdefaulttimeout(15.0)
 
 from mitmproxy import http as mitm_http
+from mitmproxy import ctx
 from mitmproxy.connection import Client, Server
 from mitmproxy.net.server_spec import parse
+from mitmproxy.proxy import commands, events, layer, mode_specs
+from mitmproxy.proxy.layers import modes
 
 logger = logging.getLogger("smart_proxy")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -561,6 +564,25 @@ def _check_auth(flow: mitm_http.HTTPFlow) -> bool:
         return False
 
 
+def _check_credentials(username: str, password: str) -> bool:
+    if not PROXY_AUTH:
+        return True
+    import hmac
+
+    return hmac.compare_digest(f"{username}:{password}", PROXY_AUTH)
+
+
+def _starts_like_tls_record(data: bytes) -> bool:
+    return len(data) >= 3 and data[0] in (20, 21, 22, 23) and data[1] == 3 and data[2] <= 4
+
+
+def _could_be_tls_record_prefix(data: bytes) -> bool:
+    return (
+        len(data) == 1 and data[0] in (20, 21, 22, 23)
+        or len(data) == 2 and data[0] in (20, 21, 22, 23) and data[1] == 3
+    )
+
+
 def _decompress_body_safe(
     content: bytes,
     encoding: Optional[str],
@@ -854,6 +876,42 @@ def _record_blocked_status(node: ProxyNode, domain: str, resp: mitm_http.Respons
         pool.mark_host_failed(node, domain)
 
 
+class RejectSocksRawTCPLayer(layer.Layer):
+    """Reject non-HTTP SOCKS payloads without opening the destination socket."""
+
+    def _handle_event(self, event):
+        if isinstance(event, events.Start):
+            logger.warning("[SmartProxy] Rejected unsupported raw TCP traffic on SOCKS ingress.")
+            yield commands.CloseConnection(self.context.client)
+            self._handle_event = self.done
+
+    def done(self, event):
+        yield from ()
+
+
+class BufferSocksTLSPrefixLayer(layer.Layer):
+    """Buffer a fragmented TLS record prefix before protocol classification."""
+
+    def __init__(self, context):
+        super().__init__(context)
+        self.events = []
+        self.client_data = bytearray()
+
+    def _handle_event(self, event):
+        if isinstance(event, events.DataReceived) and event.connection == self.context.client:
+            self.client_data.extend(event.data)
+            if len(self.client_data) < 3:
+                return
+
+            next_layer = layer.NextLayer(self.context)
+            for buffered_event in self.events:
+                yield from next_layer.handle_event(buffered_event)
+            yield from next_layer.handle_event(events.DataReceived(self.context.client, bytes(self.client_data)))
+            self._handle_event = next_layer.handle_event
+        else:
+            self.events.append(event)
+
+
 class SmartProxyAddon:
     def __init__(self):
         global _active_addon
@@ -880,6 +938,12 @@ class SmartProxyAddon:
         loader.add_option(
             "connect_timeout", float, min(INITIAL_REQUEST_TIMEOUT, UPSTREAM_CONNECT_TIMEOUT), "Upstream connect timeout"
         )
+
+    def configure(self, updated) -> None:
+        # Native SOCKS5 only advertises username/password auth when proxyauth is set.
+        # Set it from the environment so credentials never appear in process arguments.
+        if PROXY_AUTH and ctx.options.proxyauth != PROXY_AUTH:
+            ctx.options.proxyauth = PROXY_AUTH
 
     def running(self) -> None:
         _refresh_from_sources()
@@ -909,7 +973,7 @@ class SmartProxyAddon:
         if not PROXY_AUTH:
             return
 
-        if _check_auth(flow):
+        if flow.metadata.get("proxyauth") or _check_auth(flow):
             self.authenticated_conns.add(flow.client_conn.id)
             return
         else:
@@ -919,13 +983,40 @@ class SmartProxyAddon:
                 {"Proxy-Authenticate": 'Basic realm="Smart Proxy"'},
             )
 
-    def next_layer(self, nextlayer) -> None:
-        pass
+    def socks5_auth(self, data: modes.Socks5AuthData) -> None:
+        data.valid = _check_credentials(data.username, data.password)
+        if data.valid:
+            self.authenticated_conns.add(data.client_conn.id)
+
+    def next_layer(self, nextlayer: layer.NextLayer) -> None:
+        if not isinstance(nextlayer.context.client.proxy_mode, mode_specs.Socks5Mode):
+            return
+
+        data = nextlayer.data_client()
+        if not data or _starts_like_tls_record(data):
+            return
+        if _could_be_tls_record_prefix(data):
+            nextlayer.layer = BufferSocksTLSPrefixLayer(nextlayer.context)
+            return
+
+        first_line = data.split(b"\n", 1)[0]
+        if b" " in first_line and first_line.split(b" ", 1)[0].isalpha():
+            return
+
+        # Avoid rejecting a fragmented HTTP method before its first space arrives.
+        if b"\n" not in data and len(data) < 8 and data.isalpha():
+            return
+
+        nextlayer.layer = RejectSocksRawTCPLayer(nextlayer.context)
 
     def requestheaders(self, flow: mitm_http.HTTPFlow) -> None:
         client_conn = getattr(flow, "client_conn", None)
         client_id = getattr(client_conn, "id", None) if client_conn else None
-        is_authenticated = (client_id in self.authenticated_conns) or _check_auth(flow)
+        is_authenticated = (
+            client_id in self.authenticated_conns
+            or bool(flow.metadata.get("proxyauth"))
+            or _check_auth(flow)
+        )
         if not is_authenticated:
             flow.response = mitm_http.Response.make(
                 407,
@@ -944,7 +1035,11 @@ class SmartProxyAddon:
 
         client_conn = getattr(flow, "client_conn", None)
         client_id = getattr(client_conn, "id", None) if client_conn else None
-        is_authenticated = (client_id in self.authenticated_conns) or _check_auth(flow)
+        is_authenticated = (
+            client_id in self.authenticated_conns
+            or bool(flow.metadata.get("proxyauth"))
+            or _check_auth(flow)
+        )
         if not is_authenticated:
             flow.response = mitm_http.Response.make(
                 407,
