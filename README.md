@@ -48,6 +48,18 @@ curl --cacert /path/to/smart-proxy-ca.crt \
      "https://example.com"
 ```
 
+### SOCKS5
+```bash
+curl --proxy "socks5h://user:password@smart-proxy.example:1080" \
+     --cacert /path/to/smart-proxy-ca.crt \
+     "https://example.com"
+```
+
+The container runs one mitmdump process with native listeners on HTTP `8080` and
+SOCKS5 `1080`. Both use `PROXY_AUTH`, the same routing pool, TLS interception,
+retry, and cooldown logic. SOCKS5 is limited to HTTP and intercepted HTTPS;
+raw TCP and UDP tunneling are intentionally unsupported.
+
 ---
 
 ## Testing & Quality Assurance
