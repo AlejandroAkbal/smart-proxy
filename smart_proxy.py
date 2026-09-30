@@ -194,7 +194,6 @@ class ProxyNode:
 
     def record_host_failure(self, domain: str):
         now = time.time()
-        self.failure_count += 1
         if len(self.host_cooldowns) >= 500:
             active = {k: v for k, v in self.host_cooldowns.items() if v > now}
             if len(active) >= 500:
@@ -204,7 +203,6 @@ class ProxyNode:
                     active.pop(k, None)
             self.host_cooldowns = active
         self.host_cooldowns[domain] = now + COOLDOWN_SECONDS
-        self.ema_latency_ms += 500.0
 
     def record_global_failure(self):
         self.failure_count += 1
@@ -233,37 +231,82 @@ def _extract_root_domain(host: str) -> str:
 
 
 class StickyLatencyPool:
-    def __init__(self):
+    def __init__(self, history_retention_seconds: float = 3600.0, history_capacity: int = 1000):
         self.lock = threading.Lock()
         self.nodes: List[ProxyNode] = []
         self.current_nodes: dict[str, ProxyNode] = {}  # domain -> sticky ProxyNode
+        self.history_retention_seconds = max(0.0, history_retention_seconds)
+        self.history_capacity = max(0, history_capacity)
+        self.retained_nodes: dict[str, tuple[ProxyNode, float]] = {}
+        self.retention_saturated_until = 0.0
+
+    def _preserve_active_deadline(self, node: ProxyNode, wall_now: float):
+        active_until = max(
+            node.global_cooldown_until,
+            max(node.host_cooldowns.values(), default=0.0),
+        )
+        if active_until > wall_now:
+            self.retention_saturated_until = max(self.retention_saturated_until, active_until)
+
+    def _prune_retained_nodes(self, now: float):
+        cutoff = now - self.history_retention_seconds
+        wall_now = time.time()
+        for key, (node, removed_at) in list(self.retained_nodes.items()):
+            if removed_at < cutoff:
+                self._preserve_active_deadline(node, wall_now)
+                self.retained_nodes.pop(key, None)
+        overflow = len(self.retained_nodes) - self.history_capacity
+        if overflow > 0:
+            oldest = sorted(self.retained_nodes.items(), key=lambda item: item[1][1])
+            for key, (node, _) in oldest[:overflow]:
+                self._preserve_active_deadline(node, wall_now)
+                self.retained_nodes.pop(key, None)
 
     def update_nodes(self, new_nodes: List[ProxyNode]):
         if not new_nodes:
             return
         with self.lock:
+            now = time.monotonic()
+            self._prune_retained_nodes(now)
             existing = {n.key: n for n in self.nodes}
             unique_new: dict[str, ProxyNode] = {}
             for n in new_nodes:
                 if n.key not in unique_new:
                     unique_new[n.key] = n
 
+            if self.history_capacity:
+                for key, old in existing.items():
+                    if key not in unique_new:
+                        self.retained_nodes[key] = (old, now)
+                self._prune_retained_nodes(now)
+            else:
+                wall_now = time.time()
+                for key, old in existing.items():
+                    if key not in unique_new:
+                        self._preserve_active_deadline(old, wall_now)
+
             merged = []
             for key, n in unique_new.items():
-                if key in existing:
-                    old = existing[key]
+                retained = self.retained_nodes.pop(key, None)
+                old = existing.get(key) or (retained[0] if retained else None)
+                if old is not None:
                     old.scheme = n.scheme
                     old.host = n.host
                     old.port = n.port
                     old.auth = n.auth
                     # Preserve learned production EMA latency if node has live history
-                    if old.success_count == 0:
+                    if retained is None and old.success_count == 0:
                         old.ema_latency_ms = n.ema_latency_ms
                     # Only clear global cooldown if it has already expired
                     if old.global_cooldown_until <= time.time():
                         old.global_cooldown_until = 0.0
                     merged.append(old)
                 else:
+                    if self.retention_saturated_until > time.time():
+                        n.global_cooldown_until = max(
+                            n.global_cooldown_until,
+                            self.retention_saturated_until,
+                        )
                     merged.append(n)
             self.nodes = merged
             valid_keys = {n.key for n in self.nodes}
@@ -1104,6 +1147,7 @@ class SmartProxyAddon:
             )
 
             loop = asyncio.get_running_loop()
+            attempt_started = time.monotonic()
             try:
                 resp = await asyncio.wait_for(
                     loop.run_in_executor(_WORKER_EXECUTOR, _fetch_upstream_sync, flow, node, attempt_timeout),
@@ -1133,7 +1177,7 @@ class SmartProxyAddon:
                         pool.set_current_node(domain, node)
                         pool.record_latency(
                             node,
-                            (time.monotonic() - start_time) * 1000.0,
+                            (time.monotonic() - attempt_started) * 1000.0,
                             domain=domain if resp_status < 400 else None,
                         )
                     else:
