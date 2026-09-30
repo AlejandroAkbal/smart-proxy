@@ -864,7 +864,34 @@ def _fetch_upstream_sync(flow: mitm_http.HTTPFlow, node: ProxyNode, timeout: flo
         # Allow upstream servers/proxies with extensive header sets
         http.client._MAXHEADERS = 1000
 
-        conn = http.client.HTTPConnection(node.host, node.port, timeout=check_deadline())
+        class ClosingTunnelHTTPConnection(http.client.HTTPConnection):
+            def _tunnel(self):
+                connect = b"CONNECT %s:%d HTTP/1.0\r\n" % (
+                    self._tunnel_host.encode("ascii"),
+                    self._tunnel_port,
+                )
+                headers = [connect]
+                for header, value in self._tunnel_headers.items():
+                    headers.append(f"{header}: {value}\r\n".encode("latin-1"))
+                headers.append(b"\r\n")
+                self.send(b"".join(headers))
+
+                response = self.response_class(self.sock, method=self._method)
+                try:
+                    _, code, message = response._read_status()
+                    if code != 200:
+                        self.close()
+                        raise OSError(f"Tunnel connection failed: {code} {message.strip()}")
+                    while True:
+                        line = response.fp.readline(http.client._MAXLINE + 1)
+                        if len(line) > http.client._MAXLINE:
+                            raise http.client.LineTooLong("header line")
+                        if line in (b"\r\n", b"\n", b""):
+                            break
+                finally:
+                    response.close()
+
+        conn = ClosingTunnelHTTPConnection(node.host, node.port, timeout=check_deadline())
         create_connection = conn._create_connection
 
         def tracked_create_connection(*args, **kwargs):

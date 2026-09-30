@@ -1,8 +1,10 @@
 import asyncio
+import gc
 import socket
 import threading
 import time
 import unittest
+import warnings
 from unittest.mock import MagicMock
 
 # Reuse the repository's mitmproxy compatibility bootstrap before importing smart_proxy.
@@ -118,18 +120,25 @@ class TestUpstreamFailureAttribution(unittest.TestCase):
             addon.client_disconnected(flow.client_conn)
             release.set()
 
-        thread = threading.Thread(target=disconnect)
-        thread.start()
-        try:
-            asyncio.run(addon.request(flow))
-        finally:
-            release.set()
-            thread.join(timeout=2)
-            server.close()
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", ResourceWarning)
+            thread = threading.Thread(target=disconnect)
+            thread.start()
+            try:
+                asyncio.run(addon.request(flow))
+            finally:
+                release.set()
+                thread.join(timeout=2)
+                server.close()
+            for _ in range(3):
+                MagicMock()
+                gc.collect()
 
         self.assertEqual(node.failure_count, 0)
         self.assertEqual(node.global_cooldown_until, 0.0)
         self.assertNotIn("destination.test", node.host_cooldowns)
+        resource_warnings = [w for w in caught if issubclass(w.category, ResourceWarning)]
+        self.assertEqual(resource_warnings, [], [str(w.message) for w in resource_warnings])
 
     def test_failure_started_before_newer_success_cannot_requarantine(self):
         node = smart_proxy.ProxyNode("http", "127.0.0.1", 8080)
