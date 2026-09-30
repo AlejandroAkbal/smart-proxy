@@ -306,10 +306,12 @@ def test_socket_leak_on_failure():
 
     # Perform 50 rapid failed requests
     for _ in range(50):
-        smart_proxy._fetch_upstream_sync(flow, node, timeout=0.05)
+        try:
+            smart_proxy._fetch_upstream_sync(flow, node, timeout=0.05)
+        except smart_proxy.UpstreamFetchError:
+            pass
 
     server_sock.close()
-    print("  Note: socket.close() missing in 'finally' block within _fetch_upstream_sync.")
 
 # ==============================================================================
 # 5. Host Cooldown Memory Bounding & TTL Pruning
