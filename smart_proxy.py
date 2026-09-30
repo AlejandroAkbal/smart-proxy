@@ -7,6 +7,7 @@ import enum
 import gzip
 import io
 import logging
+import math
 import os
 import re
 import socket
@@ -55,16 +56,20 @@ UPSTREAM_PROXIES_ENV = os.environ.get("UPSTREAM_PROXIES", "")
 
 
 RATE_LIMIT_RPS = float(os.environ.get("RATE_LIMIT_RPS", "0"))
+# Only an otherwise exhausted request may cross a per-domain backoff this far away.
+RATE_LIMIT_ESCAPE_THRESHOLD_SECONDS = max(
+    0.0, float(os.environ.get("RATE_LIMIT_ESCAPE_THRESHOLD_SECONDS", "300"))
+)
 
 
 def parse_retry_after(
     raw_header: Optional[str],
     now: Optional[Union[float, datetime.datetime]] = None,
     min_seconds: float = 2.0,
-    max_seconds: float = 300.0,
+    max_seconds: float = float("inf"),
 ) -> Optional[float]:
     """Parses RFC 9110 Retry-After header (delta-seconds or HTTP-date).
-    Returns clamped seconds in [min_seconds, max_seconds], or None if unparseable/invalid.
+    Never caps an upstream deadline unless a caller explicitly passes max_seconds.
     """
     if not raw_header:
         return None
@@ -76,6 +81,8 @@ def parse_retry_after(
     if raw_clean.isdigit():
         try:
             val = float(raw_clean)
+            if not math.isfinite(val):
+                return None
             return min(max(val, min_seconds), max_seconds)
         except (ValueError, OverflowError):
             return None
@@ -119,6 +126,8 @@ class ProxyNode:
     auth: Optional[str] = None
     global_cooldown_until: float = 0.0
     host_cooldowns: dict[str, float] = field(default_factory=dict)
+    rate_limit_until: dict[str, float] = field(default_factory=dict)
+    rate_limit_saturated_until: float = 0.0
     consecutive_rate_limits: dict[str, int] = field(default_factory=dict)
     ema_latency_ms: float = 500.0
     success_count: int = 0
@@ -145,10 +154,32 @@ class ProxyNode:
     def is_available_for(self, domain: str, now: float) -> bool:
         if self.global_cooldown_until > now:
             return False
-        return self.host_cooldowns.get(domain, 0.0) <= now
+        return max(
+            self.host_cooldowns.get(domain, 0.0),
+            self.rate_limit_until.get(domain, 0.0),
+            self.rate_limit_saturated_until,
+        ) <= now
 
     def get_effective_cooldown(self, domain: str) -> float:
-        return max(self.global_cooldown_until, self.host_cooldowns.get(domain, 0.0))
+        return max(
+            self.global_cooldown_until,
+            self.host_cooldowns.get(domain, 0.0),
+            self.rate_limit_until.get(domain, 0.0),
+            self.rate_limit_saturated_until,
+        )
+
+    def can_try_degraded(self, domain: str, now: float) -> bool:
+        return (
+            self.rate_limit_until.get(domain, 0.0) <= now
+            and self.rate_limit_saturated_until <= now
+            and not self.is_available_for(domain, now)
+        )
+
+    def seconds_to_token(self, now: float) -> float:
+        if self.rate_limit_rps <= 0:
+            return 0.0
+        tokens = min(self.bucket_capacity, self.tokens + max(0.0, now - self.last_token_update) * self.rate_limit_rps)
+        return max(0.0, 1.0 - tokens) / self.rate_limit_rps
 
     def try_consume_token(self) -> bool:
         if self.rate_limit_rps <= 0:
@@ -175,12 +206,14 @@ class ProxyNode:
         domain: str,
         retry_after_s: Optional[float] = None,
         expected_generation: Optional[int] = None,
+        count_event: bool = True,
     ) -> bool:
         if expected_generation is not None and self.host_health_generations.get(domain, 0) != expected_generation:
             return False
         now = time.time()
         count = self.consecutive_rate_limits.get(domain, 0) + 1
-        self.consecutive_rate_limits[domain] = count
+        if count_event:
+            self.consecutive_rate_limits[domain] = count
 
         if len(self.consecutive_rate_limits) >= 500:
             sorted_domains = list(self.consecutive_rate_limits.keys())
@@ -201,7 +234,15 @@ class ProxyNode:
                     active.pop(k, None)
             self.host_cooldowns = active
 
-        self.host_cooldowns[domain] = now + cooldown
+        until = now + cooldown
+        if len(self.rate_limit_until) >= 500 and domain not in self.rate_limit_until:
+            active = {key: deadline for key, deadline in self.rate_limit_until.items() if deadline > now}
+            if len(active) >= 500:
+                key = min(active, key=active.get)
+                self.rate_limit_saturated_until = max(self.rate_limit_saturated_until, active.pop(key))
+            self.rate_limit_until = active
+        self.rate_limit_until[domain] = max(self.rate_limit_until.get(domain, 0.0), until)
+        self.host_cooldowns[domain] = max(self.host_cooldowns.get(domain, 0.0), until)
         # Rate limits do not penalize ema_latency_ms and do not increment failure_count
         return True
 
@@ -217,7 +258,7 @@ class ProxyNode:
                 for k in sorted_keys[:100]:
                     active.pop(k, None)
             self.host_cooldowns = active
-        self.host_cooldowns[domain] = now + COOLDOWN_SECONDS
+        self.host_cooldowns[domain] = max(self.host_cooldowns.get(domain, 0.0), now + COOLDOWN_SECONDS)
         return True
 
     def record_global_failure(self, expected_generation: Optional[int] = None) -> bool:
@@ -263,6 +304,8 @@ class StickyLatencyPool:
         active_until = max(
             node.global_cooldown_until,
             max(node.host_cooldowns.values(), default=0.0),
+            max(node.rate_limit_until.values(), default=0.0),
+            node.rate_limit_saturated_until,
         )
         if active_until > wall_now:
             self.retention_saturated_until = max(self.retention_saturated_until, active_until)
@@ -350,7 +393,7 @@ class StickyLatencyPool:
                         if candidate.try_consume_token():
                             self.current_nodes[domain] = candidate
                             return candidate
-                # If all rate limited or rate check disabled, pick top healthy
+                    return None
                 best = healthy[0]
                 self.current_nodes[domain] = best
                 return best
@@ -387,13 +430,86 @@ class StickyLatencyPool:
         return self.select_best_for(domain, check_rate_limit=True)
 
     def has_untried_healthy(self, domain: str, tried_keys: Set[str]) -> bool:
-        """Returns True if there is at least one healthy, untried candidate for domain."""
+        """Returns True if an untried node exists in any permitted selection tier."""
         with self.lock:
             now = time.time()
             return any(
-                n.key not in tried_keys and n.is_available_for(domain, now)
+                n.key not in tried_keys
+                and (
+                    n.is_available_for(domain, now)
+                    or self._can_try_degraded(n, domain, now)
+                    or self._can_escape_rate_limit(n, domain, now)
+                )
                 for n in self.nodes
             )
+
+    def _can_try_degraded(self, node: ProxyNode, domain: str, now: float) -> bool:
+        return self.retention_saturated_until <= now and node.can_try_degraded(domain, now)
+
+    def _can_escape_rate_limit(self, node: ProxyNode, domain: str, now: float) -> bool:
+        return (
+            self.retention_saturated_until <= now
+            and node.global_cooldown_until <= now
+            and node.rate_limit_saturated_until <= now
+            and node.rate_limit_until.get(domain, 0.0) - now > RATE_LIMIT_ESCAPE_THRESHOLD_SECONDS
+        )
+
+    def next_token_wait(
+        self, domain: str, exclude_keys: Optional[Set[str]] = None,
+        degraded: bool = False, rate_limit_escape: bool = False,
+    ) -> Optional[float]:
+        with self.lock:
+            now = time.time()
+            untried = [n for n in self.nodes if n.key not in (exclude_keys or set())]
+            if rate_limit_escape:
+                if any(n.is_available_for(domain, now) or self._can_try_degraded(n, domain, now) for n in untried):
+                    return None
+                candidates = [n for n in untried if self._can_escape_rate_limit(n, domain, now)]
+            elif degraded:
+                candidates = [n for n in untried if self._can_try_degraded(n, domain, now)]
+            else:
+                candidates = [n for n in untried if n.is_available_for(domain, now)]
+            return min((n.seconds_to_token(now) for n in candidates), default=None)
+
+    def select_degraded_for(
+        self, domain: str, exclude_keys: Optional[Set[str]] = None
+    ) -> Optional[ProxyNode]:
+        """Last resort: try a cooled, untried node, but never a rate-limited node."""
+        with self.lock:
+            now = time.time()
+            candidates = [
+                n for n in self.nodes
+                if n.key not in (exclude_keys or set()) and self._can_try_degraded(n, domain, now)
+            ]
+            candidates.sort(key=lambda n: (
+                n.global_cooldown_until > now,
+                n.get_effective_cooldown(domain),
+                n.ema_latency_ms,
+                n.failure_count,
+            ))
+            for candidate in candidates:
+                if candidate.try_consume_token():
+                    return candidate
+            return None
+
+    def select_rate_limit_escape_for(
+        self, domain: str, exclude_keys: Optional[Set[str]] = None
+    ) -> Optional[ProxyNode]:
+        """Final resort after all healthy and non-rate-limited cooled nodes are exhausted."""
+        with self.lock:
+            now = time.time()
+            untried = [n for n in self.nodes if n.key not in (exclude_keys or set())]
+            if any(n.is_available_for(domain, now) or self._can_try_degraded(n, domain, now) for n in untried):
+                return None
+            candidates = [n for n in untried if self._can_escape_rate_limit(n, domain, now)]
+            # Cross the least remaining upstream backoff; never change its stored deadline.
+            candidates.sort(key=lambda n: (
+                n.rate_limit_until[domain], n.ema_latency_ms, n.failure_count,
+            ))
+            for candidate in candidates:
+                if candidate.try_consume_token():
+                    return candidate
+            return None
 
     def select_candidate_for(
         self, domain: str, exclude_keys: Optional[Set[str]] = None, check_rate_limit: bool = True
@@ -414,6 +530,7 @@ class StickyLatencyPool:
                     for candidate in healthy:
                         if candidate.try_consume_token():
                             return candidate
+                    return None
                 return healthy[0]
             return None
 
@@ -437,9 +554,10 @@ class StickyLatencyPool:
         domain: str,
         retry_after_s: Optional[float] = None,
         expected_generation: Optional[int] = None,
+        count_event: bool = True,
     ) -> bool:
         with self.lock:
-            if not node.record_host_rate_limit(domain, retry_after_s, expected_generation):
+            if not node.record_host_rate_limit(domain, retry_after_s, expected_generation, count_event):
                 return False
             if self.current_nodes.get(domain) and self.current_nodes[domain].key == node.key:
                 self.current_nodes.pop(domain, None)
@@ -1016,6 +1134,12 @@ def _record_blocked_status(
         pool.mark_host_rate_limit(node, domain, retry_after_s, expected_generation)
     else:
         pool.mark_host_failed(node, domain, expected_generation)
+        if retry_after_raw:
+            retry_after_s = parse_retry_after(retry_after_raw)
+            if retry_after_s is not None:
+                pool.mark_host_rate_limit(
+                    node, domain, retry_after_s, expected_generation, count_event=False
+                )
 
 
 class RejectSocksRawTCPLayer(layer.Layer):
@@ -1227,7 +1351,6 @@ class SmartProxyAddon:
         tried_keys: Set[str] = set()
 
         while True:
-            attempt += 1
             now = time.monotonic()
             remaining_budget = GLOBAL_REQUEST_TIMEOUT - (now - start_time)
             if remaining_budget < 1.0:
@@ -1240,7 +1363,7 @@ class SmartProxyAddon:
                 logger.info(f"[SmartProxy] Client disconnected on {domain}, aborting attempt loop.")
                 break
 
-            if attempt == 1:
+            if attempt == 0:
                 node = pool.get_current_or_best(domain)
                 if not node or node.key in tried_keys:
                     node = pool.select_candidate_for(domain, exclude_keys=tried_keys)
@@ -1248,11 +1371,38 @@ class SmartProxyAddon:
                 node = pool.select_candidate_for(domain, exclude_keys=tried_keys)
 
             if not node:
+                token_wait = pool.next_token_wait(domain, exclude_keys=tried_keys)
+                if token_wait is None:
+                    node = pool.select_degraded_for(domain, exclude_keys=tried_keys)
+                    if node:
+                        logger.info(
+                            f"[SmartProxy] No untried healthy node for {domain}; trying cooled {node.key} as last resort."
+                        )
+                    if not node:
+                        token_wait = pool.next_token_wait(domain, exclude_keys=tried_keys, degraded=True)
+                    if not node and token_wait is None:
+                        node = pool.select_rate_limit_escape_for(domain, exclude_keys=tried_keys)
+                        if node:
+                            logger.info(
+                                f"[SmartProxy] No untried healthy or cooled node for {domain}; "
+                                f"trying long-backoff {node.key} as final resort."
+                            )
+                        else:
+                            token_wait = pool.next_token_wait(
+                                domain, exclude_keys=tried_keys, rate_limit_escape=True
+                            )
+                if not node and token_wait is not None:
+                    wait = min(max(token_wait, 0.001), 1.0, remaining_budget - 1.0)
+                    if wait > 0:
+                        await asyncio.sleep(wait)
+                        continue
+            if not node:
                 logger.warning(
-                    f"[SmartProxy] All available proxy nodes exhausted for {domain} on attempt {attempt}."
+                    f"[SmartProxy] All available proxy nodes exhausted for {domain} on attempt {attempt + 1}."
                 )
                 break
 
+            attempt += 1
             tried_keys.add(node.key)
             attempt_generation = node.health_generation
             attempt_host_generation = node.host_health_generations.get(domain, 0)
