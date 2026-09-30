@@ -294,7 +294,8 @@ class TestResilienceAndFraming(unittest.TestCase):
         finally:
             smart_proxy._fetch_upstream_sync = orig_fetch
 
-        self.assertEqual(len(attempts), 2)
+        self.assertEqual(len(attempts), 3)
+        self.assertEqual(set(attempts), {n1.key, n2.key, n3.key})
         self.assertEqual(flow.response.status_code, 503)
 
     def test_budget_driven_retry_all_connection_failures_returns_504(self):
@@ -340,7 +341,7 @@ class TestRetryAfterAndRateLimiting(unittest.TestCase):
         """Delta-seconds must parse integer seconds and clamp within [min_seconds, max_seconds]."""
         self.assertEqual(parse_retry_after("15"), 15.0)
         self.assertEqual(parse_retry_after("1"), 2.0)  # Clamped to min 2.0s
-        self.assertEqual(parse_retry_after("500"), 300.0)  # Clamped to max 300.0s
+        self.assertEqual(parse_retry_after("500"), 500.0)  # Do not shorten upstream Retry-After
         self.assertEqual(parse_retry_after("   60   "), 60.0)
         self.assertEqual(parse_retry_after('"120"'), 120.0)
 
@@ -440,8 +441,9 @@ class TestRetryAfterAndRateLimiting(unittest.TestCase):
         node.record_host_failure("donmai.us")
         self.assertEqual(node.consecutive_rate_limits.get("donmai.us"), 1)
 
-        # Clear cooldown so node is available for flow test
+        # Clear both cooldown and hard rate-limit state for this unrelated flow test.
         node.host_cooldowns.clear()
+        node.rate_limit_until.clear()
 
         # Integration: HTTP 500 through flow must not clear rate limit count
         from smart_proxy import pool as global_pool, SmartProxyAddon

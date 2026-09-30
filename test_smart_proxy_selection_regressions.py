@@ -22,7 +22,17 @@ except ImportError:
         def __init__(self, status_code=200, content=b"", headers=None):
             self.status_code = status_code
             self.content = content
-            self.headers = headers or {}
+            # mitmproxy accepts headers as a list of byte pairs or a mapping;
+            # normalise to a mapping so production code can call .get() either way.
+            h_dict = {}
+            if isinstance(headers, list):
+                for k, v in headers:
+                    k_str = k.decode() if isinstance(k, bytes) else str(k)
+                    v_str = v.decode() if isinstance(v, bytes) else str(v)
+                    h_dict[k_str] = v_str
+            elif isinstance(headers, dict):
+                h_dict = dict(headers)
+            self.headers = h_dict
 
         @classmethod
         def make(cls, status_code, content=b"", headers=None):
