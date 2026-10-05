@@ -59,6 +59,132 @@ class TestPoolCapacity(unittest.TestCase):
         flow.client_conn = MagicMock(connected=True, id="capacity-client")
         return flow
 
+    def test_primary_nodes_outrank_faster_adapter_nodes_and_reclaim_stickiness(self):
+        primary = smart_proxy.ProxyNode(
+            "http",
+            "100.64.0.1",
+            8080,
+            tier=smart_proxy.PRIMARY_NODE_TIER,
+            ema_latency_ms=500.0,
+        )
+        adapter = smart_proxy.ProxyNode(
+            "http",
+            "198.51.100.1",
+            8080,
+            tier=smart_proxy.ADAPTER_NODE_TIER,
+            ema_latency_ms=1.0,
+        )
+        self.pool.update_nodes([adapter, primary])
+
+        selected = self.pool.select_best_for("destination.test", check_rate_limit=False)
+        self.assertIs(selected, primary)
+
+        self.pool.set_current_node("other.test", adapter)
+        migrated = self.pool.get_current_or_best("other.test")
+        self.assertIs(migrated, primary)
+
+        self.pool.mark_global_failed(primary)
+        self.assertIs(self.pool.select_candidate_for("fallback.test"), adapter)
+
+    def test_source_parsers_assign_primary_and_adapter_tiers(self):
+        configured = smart_proxy._parse_proxy_url("http://user:pass@100.64.0.2:8080")
+        adapter_nodes = smart_proxy._parse_yaml_proxies(
+            "- name: public\n  type: http\n  server: 198.51.100.2\n  port: 8080\n"
+        )
+
+        self.assertIsNotNone(configured)
+        self.assertEqual(configured.tier, smart_proxy.PRIMARY_NODE_TIER)
+        self.assertEqual(configured.auth, "user:pass")
+        self.assertEqual(len(adapter_nodes), 1)
+        self.assertEqual(adapter_nodes[0].tier, smart_proxy.ADAPTER_NODE_TIER)
+
+    def test_host_failure_backoff_recovers_and_resets_after_success(self):
+        node = self.node()
+        domain = "destination.test"
+        with patch.object(smart_proxy, "COOLDOWN_SECONDS", 600), patch.object(
+            smart_proxy.time, "time", return_value=1000.0
+        ):
+            for expected in (5.0, 15.0, 30.0, 60.0, 600.0):
+                self.assertTrue(node.record_host_failure(domain))
+                self.assertAlmostEqual(node.host_cooldowns[domain] - 1000.0, expected, delta=0.01)
+
+            self.assertFalse(node.is_available_for(domain, 1000.0))
+            self.assertTrue(node.is_available_for(domain, 1600.0))
+            node.record_success(20.0, domain=domain)
+            self.assertNotIn(domain, node.host_failure_counts)
+
+        with patch.object(smart_proxy, "COOLDOWN_SECONDS", 600), patch.object(
+            smart_proxy.time, "time", return_value=2000.0
+        ):
+            node.record_host_failure(domain)
+            self.assertAlmostEqual(node.host_cooldowns[domain] - 2000.0, 5.0, delta=0.01)
+
+    def test_request_attempts_are_bounded_and_replays_use_short_timeout(self):
+        nodes = [
+            smart_proxy.ProxyNode("http", "198.51.100.10", 8000 + index)
+            for index in range(10)
+        ]
+        self.pool.update_nodes(nodes)
+        attempts = []
+
+        def failed_fetch(_flow, node, timeout):
+            attempts.append((node.key, timeout))
+            return None
+
+        with patch.object(smart_proxy, "_fetch_upstream_sync", side_effect=failed_fetch):
+            asyncio.run(smart_proxy.SmartProxyAddon().request(self.flow()))
+
+        self.assertEqual(len(attempts), smart_proxy.MAX_ATTEMPTS_PER_REQUEST)
+        self.assertLessEqual(len(attempts), 6)
+        self.assertEqual(attempts[0][1], smart_proxy.INITIAL_REQUEST_TIMEOUT)
+        self.assertTrue(all(timeout == smart_proxy.REPLAY_TIMEOUT for _, timeout in attempts[1:]))
+
+    def test_retry_after_response_and_deadline_are_unchanged(self):
+        node = self.node()
+        self.pool.update_nodes([node])
+        response = MagicMock(
+            status_code=429,
+            content=b"Too Many Requests",
+            headers={"Retry-After": "900"},
+        )
+        before = time.time()
+        with patch.object(smart_proxy, "_fetch_upstream_sync", return_value=response):
+            flow = self.flow()
+            asyncio.run(smart_proxy.SmartProxyAddon().request(flow))
+
+        self.assertIs(flow.response, response)
+        self.assertEqual(flow.response.headers["Retry-After"], "900")
+        self.assertGreaterEqual(node.rate_limit_until["destination.test"], before + 899.0)
+        rate_limit_deadline = node.rate_limit_until["destination.test"]
+        self.pool.mark_host_failed(node, "destination.test")
+        self.assertEqual(node.rate_limit_until["destination.test"], rate_limit_deadline)
+        self.assertGreaterEqual(node.host_cooldowns["destination.test"], rate_limit_deadline)
+
+    def test_failure_kind_keeps_proxy_and_destination_quarantines_distinct(self):
+        cases = (
+            (smart_proxy.UpstreamFailureKind.PROXY_CONNECT, "global"),
+            (smart_proxy.UpstreamFailureKind.DESTINATION, "host"),
+            (smart_proxy.UpstreamFailureKind.CALLER_CANCELLED, "none"),
+        )
+        for index, (kind, expected_scope) in enumerate(cases):
+            self.pool.nodes = []
+            self.pool.current_nodes.clear()
+            node = smart_proxy.ProxyNode("http", "198.51.100.20", 8100 + index)
+            self.pool.update_nodes([node])
+            error = smart_proxy.UpstreamFetchError(kind, RuntimeError(kind.value))
+            with patch.object(smart_proxy, "_fetch_upstream_sync", side_effect=error):
+                asyncio.run(smart_proxy.SmartProxyAddon().request(self.flow()))
+
+            if expected_scope == "global":
+                self.assertGreater(node.global_cooldown_until, time.time())
+                self.assertNotIn("destination.test", node.host_cooldowns)
+            elif expected_scope == "host":
+                self.assertEqual(node.global_cooldown_until, 0.0)
+                self.assertGreater(node.host_cooldowns["destination.test"], time.time())
+            else:
+                self.assertEqual(node.global_cooldown_until, 0.0)
+                self.assertNotIn("destination.test", node.host_cooldowns)
+
     def test_fifteen_nodes_cooled_for_600_seconds_can_use_one_last_resort(self):
         node = self.node(ema_latency_ms=10.0)
         other_nodes = [
