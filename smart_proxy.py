@@ -40,13 +40,25 @@ RETRY_STATUSES = {403, 429, 502, 503, 504}
 SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
 
 COOLDOWN_SECONDS = int(os.environ.get("COOLDOWN_SECONDS", "60"))
-# Legacy parameter kept for backward-compatibility; retry loop is purely budget-driven
+# Legacy parameter kept for backward-compatibility; the request loop applies a hard ceiling.
 MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "10"))
+
+# Configured upstreams are the reliability floor. Adapter-fed nodes remain available as
+# overflow, but never outrank a healthy configured node. Keep the attempt ceiling hard even
+# when an older MAX_RETRIES setting is still present in the environment.
+PRIMARY_NODE_TIER = 0
+ADAPTER_NODE_TIER = 1
+HOST_FAILURE_BACKOFF_SECONDS = (5.0, 15.0, 30.0, 60.0)
+_configured_attempt_limit = os.environ.get(
+    "MAX_ATTEMPTS_PER_REQUEST",
+    os.environ.get("MAX_ATTEMPTS", str(MAX_RETRIES + 1)),
+)
+MAX_ATTEMPTS_PER_REQUEST = max(1, min(6, int(_configured_attempt_limit)))
 
 # Strict end-to-end deadline budget and timeouts (user SLA: 60s global budget, 15s initial attempt)
 GLOBAL_REQUEST_TIMEOUT = float(os.environ.get("GLOBAL_REQUEST_TIMEOUT", "60.0"))
 INITIAL_REQUEST_TIMEOUT = float(os.environ.get("INITIAL_REQUEST_TIMEOUT", "15.0"))
-REPLAY_TIMEOUT = float(os.environ.get("REPLAY_TIMEOUT", "15.0"))
+REPLAY_TIMEOUT = min(5.0, float(os.environ.get("REPLAY_TIMEOUT", "5.0")))
 UPSTREAM_CONNECT_TIMEOUT = float(os.environ.get("UPSTREAM_CONNECT_TIMEOUT", "10.0"))
 MAX_DECOMPRESSED_BYTES = int(os.environ.get("MAX_DECOMPRESSED_BYTES", str(20 * 1024 * 1024)))
 ADAPTER_URL = os.environ.get("ADAPTER_URL", "").rstrip("/")
@@ -140,6 +152,8 @@ class ProxyNode:
     last_token_update: float = field(default_factory=time.time)
     rate_limit_rps: float = RATE_LIMIT_RPS
     bucket_capacity: float = 5.0
+    tier: int = PRIMARY_NODE_TIER
+    host_failure_counts: dict[str, int] = field(default_factory=dict)
 
     @property
     def key(self) -> str:
@@ -200,6 +214,7 @@ class ProxyNode:
         if domain:
             self.host_health_generations[domain] = self.host_health_generations.get(domain, 0) + 1
             self.consecutive_rate_limits.pop(domain, None)
+            self.host_failure_counts.pop(domain, None)
 
     def record_host_rate_limit(
         self,
@@ -258,7 +273,28 @@ class ProxyNode:
                 for k in sorted_keys[:100]:
                     active.pop(k, None)
             self.host_cooldowns = active
-        self.host_cooldowns[domain] = max(self.host_cooldowns.get(domain, 0.0), now + COOLDOWN_SECONDS)
+
+        # Keep the consecutive-failure state bounded with the host cooldown map. Expired
+        # entries are deliberately forgotten so a later isolated failure starts at 5 seconds.
+        self.host_failure_counts = {
+            key: count
+            for key, count in self.host_failure_counts.items()
+            if self.host_cooldowns.get(key, 0.0) > now
+        }
+
+        # A transient destination failure should not banish a configured node for the full
+        # production cooldown on its first event. Consecutive failures back off quickly, while
+        # a clean success resets the streak. Existing Retry-After deadlines still win below.
+        previous_until = self.host_cooldowns.get(domain, 0.0)
+        streak = self.host_failure_counts.get(domain, 0) if previous_until > now else 0
+        streak += 1
+        self.host_failure_counts[domain] = streak
+        if streak <= len(HOST_FAILURE_BACKOFF_SECONDS):
+            cooldown = HOST_FAILURE_BACKOFF_SECONDS[streak - 1]
+        else:
+            cooldown = float(COOLDOWN_SECONDS)
+        cooldown = min(cooldown, float(COOLDOWN_SECONDS))
+        self.host_cooldowns[domain] = max(previous_until, now + cooldown)
         return True
 
     def record_global_failure(self, expected_generation: Optional[int] = None) -> bool:
@@ -356,6 +392,7 @@ class StickyLatencyPool:
                     old.host = n.host
                     old.port = n.port
                     old.auth = n.auth
+                    old.tier = n.tier
                     # Preserve learned production EMA latency if node has live history
                     if retained is None and old.success_count == 0:
                         old.ema_latency_ms = n.ema_latency_ms
@@ -378,15 +415,19 @@ class StickyLatencyPool:
                 if n.key in valid_keys
             }
 
+    @staticmethod
+    def _selection_key(node: ProxyNode):
+        return (node.tier, node.ema_latency_ms, node.failure_count)
+
     def select_best_for(self, domain: str, check_rate_limit: bool = True) -> Optional[ProxyNode]:
-        """Picks the lowest latency available node for domain and makes it sticky."""
+        """Prefers the best available source tier, then latency, and makes it sticky."""
         with self.lock:
             if not self.nodes:
                 return None
             now = time.time()
             healthy = [n for n in self.nodes if n.is_available_for(domain, now)]
             if healthy:
-                healthy.sort(key=lambda n: (n.ema_latency_ms, n.failure_count))
+                healthy.sort(key=self._selection_key)
                 if check_rate_limit:
                     # Pick lowest latency node that has token available
                     for candidate in healthy:
@@ -416,9 +457,14 @@ class StickyLatencyPool:
                     if n.key != current.key and n.is_available_for(domain, now)
                 ]
                 if healthy_alts:
-                    healthy_alts.sort(key=lambda n: (n.ema_latency_ms, n.failure_count))
+                    healthy_alts.sort(key=self._selection_key)
                     for alt in healthy_alts:
-                        if current.ema_latency_ms > (alt.ema_latency_ms * 1.5):
+                        preferred_tier = alt.tier < current.tier
+                        significantly_faster = (
+                            alt.tier == current.tier
+                            and current.ema_latency_ms > (alt.ema_latency_ms * 1.5)
+                        )
+                        if preferred_tier or significantly_faster:
                             if alt.try_consume_token():
                                 self.current_nodes[domain] = alt
                                 return alt
@@ -484,6 +530,7 @@ class StickyLatencyPool:
             candidates.sort(key=lambda n: (
                 n.global_cooldown_until > now,
                 n.get_effective_cooldown(domain),
+                n.tier,
                 n.ema_latency_ms,
                 n.failure_count,
             ))
@@ -525,7 +572,7 @@ class StickyLatencyPool:
                 if n.key not in exclude and n.is_available_for(domain, now)
             ]
             if healthy:
-                healthy.sort(key=lambda n: (n.ema_latency_ms, n.failure_count))
+                healthy.sort(key=self._selection_key)
                 if check_rate_limit:
                     for candidate in healthy:
                         if candidate.try_consume_token():
@@ -584,7 +631,7 @@ class StickyLatencyPool:
 pool = StickyLatencyPool()
 
 
-def _parse_proxy_url(url_str: str) -> Optional[ProxyNode]:
+def _parse_proxy_url(url_str: str, tier: int = PRIMARY_NODE_TIER) -> Optional[ProxyNode]:
     try:
         parsed = urllib.parse.urlsplit(url_str.strip())
         scheme = parsed.scheme.lower() if parsed.scheme else "http"
@@ -596,13 +643,13 @@ def _parse_proxy_url(url_str: str) -> Optional[ProxyNode]:
         if parsed.username or parsed.password:
             auth = f"{parsed.username or ''}:{parsed.password or ''}"
         if host and port:
-            return ProxyNode(scheme=scheme, host=host, port=port, auth=auth)
+            return ProxyNode(scheme=scheme, host=host, port=port, auth=auth, tier=tier)
     except Exception:
         pass
     return None
 
 
-def _parse_yaml_proxies(raw_text: str) -> List[ProxyNode]:
+def _parse_yaml_proxies(raw_text: str, tier: int = ADAPTER_NODE_TIER) -> List[ProxyNode]:
     nodes = []
     cur_type = "http"
     cur_server = ""
@@ -615,7 +662,9 @@ def _parse_yaml_proxies(raw_text: str) -> List[ProxyNode]:
         if line.startswith("- name:") or line.startswith("name:"):
             if cur_server and cur_port:
                 auth = f"{cur_user}:{cur_pass}" if cur_user else None
-                nodes.append(ProxyNode(scheme=cur_type, host=cur_server, port=cur_port, auth=auth))
+                nodes.append(
+                    ProxyNode(scheme=cur_type, host=cur_server, port=cur_port, auth=auth, tier=tier)
+                )
             cur_type = "http"
             cur_server = ""
             cur_port = 0
@@ -637,7 +686,7 @@ def _parse_yaml_proxies(raw_text: str) -> List[ProxyNode]:
 
     if cur_server and cur_port:
         auth = f"{cur_user}:{cur_pass}" if cur_user else None
-        nodes.append(ProxyNode(scheme=cur_type, host=cur_server, port=cur_port, auth=auth))
+        nodes.append(ProxyNode(scheme=cur_type, host=cur_server, port=cur_port, auth=auth, tier=tier))
     return nodes
 
 
@@ -684,7 +733,7 @@ def _refresh_from_sources():
     # 1. Direct environment proxy list
     if UPSTREAM_PROXIES_ENV:
         for entry in UPSTREAM_PROXIES_ENV.split(","):
-            node = _parse_proxy_url(entry)
+            node = _parse_proxy_url(entry, tier=PRIMARY_NODE_TIER)
             if node:
                 all_nodes.append(node)
 
@@ -702,7 +751,7 @@ def _refresh_from_sources():
                 req = urllib.request.Request(url, headers={"User-Agent": "SmartProxy"})
                 with urllib.request.urlopen(req, timeout=4) as resp:
                     text = resp.read().decode("utf-8", errors="replace")
-                    all_nodes.extend(_parse_yaml_proxies(text))
+                    all_nodes.extend(_parse_yaml_proxies(text, tier=ADAPTER_NODE_TIER))
             except Exception:
                 pass
 
@@ -1346,11 +1395,10 @@ class SmartProxyAddon:
         start_time = flow.metadata.get("start_time") or time.monotonic()
         flow.metadata["start_time"] = start_time
 
-        last_failed: Optional[ProxyNode] = None
         attempt = 0
         tried_keys: Set[str] = set()
 
-        while True:
+        while attempt < MAX_ATTEMPTS_PER_REQUEST:
             now = time.monotonic()
             remaining_budget = GLOBAL_REQUEST_TIMEOUT - (now - start_time)
             if remaining_budget < 1.0:
@@ -1423,7 +1471,7 @@ class SmartProxyAddon:
             try:
                 resp = await asyncio.wait_for(
                     loop.run_in_executor(_WORKER_EXECUTOR, _fetch_upstream_sync, flow, node, attempt_timeout),
-                    timeout=attempt_timeout + 0.2,
+                    timeout=attempt_timeout,
                 )
             except asyncio.TimeoutError:
                 logger.warning(f"[SmartProxy] Attempt {attempt} on {node.key} hit asyncio timeout ({attempt_timeout:.1f}s)")
@@ -1451,7 +1499,13 @@ class SmartProxyAddon:
 
                 remaining_after = GLOBAL_REQUEST_TIMEOUT - (time.monotonic() - start_time)
                 has_untried = pool.has_untried_healthy(domain, tried_keys)
-                if not resp_blocked or not allow_replay or remaining_after < 1.0 or not has_untried:
+                if (
+                    not resp_blocked
+                    or not allow_replay
+                    or remaining_after < 1.0
+                    or not has_untried
+                    or attempt >= MAX_ATTEMPTS_PER_REQUEST
+                ):
                     flow.response = resp
                     flow.metadata["upstream_proxy"] = node
                     if not resp_blocked:
@@ -1492,7 +1546,11 @@ class SmartProxyAddon:
                     )
                     break
 
-            last_failed = node
+        if attempt >= MAX_ATTEMPTS_PER_REQUEST and flow.response is None:
+            logger.warning(
+                f"[SmartProxy] Attempt ceiling reached for {domain} ({MAX_ATTEMPTS_PER_REQUEST}); "
+                "returning 504 without probing additional upstream nodes."
+            )
 
         if flow.response is None:
             flow.response = mitm_http.Response.make(
